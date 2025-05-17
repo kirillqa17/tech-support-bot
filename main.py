@@ -40,13 +40,13 @@ def handle_extend_command(message):
     try:
         # Разбиваем сообщение на части: /extend TG_ID
         parts = message.text.split()
-        if len(parts) >= 2:
+        if len(parts) <= 2:
             bot.reply_to(message, "Использование: /extend TG_ID PLAN DAYS")
             return
 
         tg_id = int(parts[1])
         plan = parts[2]
-        days = parts[3]
+        days = int(parts[3])
         # Отправляем запрос на API для продления подписки
         response = requests.post(f"{API_URL}/{tg_id}/extend", json={"days" : days, "plan" : plan})
 
