@@ -55,7 +55,7 @@ def handle_extend_command(message):
         print(f"Extending subscription for: {tg_id} {plan} {days}")  # Для отладки
 
         # Отправляем запрос на API для продления подписки
-        response = requests.post(
+        response = requests.patch(
             f"{API_URL}/{tg_id}/extend",
             json={"days": days, "plan": plan}
         )
