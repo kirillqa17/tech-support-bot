@@ -40,7 +40,7 @@ def handle_extend_command(message):
     try:
         # Разбиваем сообщение на части: /extend TG_ID
         parts = message.text.split()
-        if len(parts) != 2:
+        if len(parts) >= 2:
             bot.reply_to(message, "Использование: /extend TG_ID PLAN DAYS")
             return
 
