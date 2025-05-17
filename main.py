@@ -3,6 +3,7 @@ import telebot
 from telebot import types
 from dotenv import load_dotenv
 from collections import defaultdict
+import requests  # Добавляем для работы с API
 
 # Загружаем переменные из .env файла
 load_dotenv()
@@ -10,6 +11,7 @@ load_dotenv()
 # Получаем токен бота и список админов из .env
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 ADMIN_IDS = list(map(int, os.getenv('ADMIN_IDS').split(',')))
+API_URL = os.getenv('API_URL')  # URL вашего API для продления подписки
 
 # Инициализируем бота
 bot = telebot.TeleBot(BOT_TOKEN)
@@ -25,9 +27,37 @@ pending_messages = defaultdict(list)  # {user_id: [message1, message2, ...]}
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
     if message.from_user.id in ADMIN_IDS:
-        bot.send_message(message.chat.id, "Вы админ. Используйте /reply для ответа на сообщения.")
+        bot.send_message(message.chat.id,
+                         "Вы админ. Используйте /reply для ответа на сообщения или /extend для продления подписки.")
     else:
-        bot.reply_to(message, "Привет! Это бот техподдержки SvoiVPN. Напишите ваш вопрос, и мы обязательно вам ответим в скором времени!")
+        bot.reply_to(message,
+                     "Привет! Это бот техподдержки SvoiVPN. Напишите ваш вопрос, и мы обязательно вам ответим в скором времени!")
+
+
+# Обработчик команды /extend для админов
+@bot.message_handler(commands=['extend'], func=lambda message: message.from_user.id in ADMIN_IDS)
+def handle_extend_command(message):
+    try:
+        # Разбиваем сообщение на части: /extend TG_ID
+        parts = message.text.split()
+        if len(parts) != 2:
+            bot.reply_to(message, "Использование: /extend TG_ID PLAN DAYS")
+            return
+
+        tg_id = int(parts[1])
+        plan = parts[2]
+        days = parts[3]
+        # Отправляем запрос на API для продления подписки
+        response = requests.post(f"{API_URL}/{tg_id}/extend", json={"days" : days, "plan" : plan})
+
+        if response.status_code == 200:
+            bot.reply_to(message, f"Подписка для пользователя с ID {tg_id} успешно продлена.")
+        else:
+            bot.reply_to(message, f"Ошибка при продлении подписки: {response.text}")
+    except ValueError:
+        bot.reply_to(message, "Неверный формат ID. ID должен быть числом.")
+    except Exception as e:
+        bot.reply_to(message, f"Произошла ошибка: {str(e)}")
 
 
 # Обработчик всех сообщений от пользователей
@@ -140,7 +170,8 @@ def close_ticket(admin_chat_id, user_id):
 
 # Обработчик ответов админов
 @bot.message_handler(func=lambda message: message.reply_to_message is not None and
-                                          message.from_user.id in ADMIN_IDS)
+                                          message.from_user.id in ADMIN_IDS,
+                     content_types=['text', 'photo', 'document', 'audio', 'video', 'voice', 'sticker'])
 def handle_admin_reply(message):
     reply_text = message.reply_to_message.text
     if not reply_text or "Вы просматриваете тикет @" not in reply_text:
@@ -161,15 +192,16 @@ def handle_admin_reply(message):
         if message.content_type == 'text':
             bot.send_message(user_id, f"✉️ Ответ поддержки:\n{message.text}")
         elif message.content_type == 'photo':
-            bot.send_photo(user_id, message.photo[-1].file_id, caption="✉️ Ответ поддержки")
+            bot.send_photo(user_id, message.photo[-1].file_id, caption=f"✉️ Ответ поддержки:\n{message.caption or ''}")
         elif message.content_type == 'document':
-            bot.send_document(user_id, message.document.file_id, caption="✉️ Ответ поддержки")
+            bot.send_document(user_id, message.document.file_id,
+                              caption=f"✉️ Ответ поддержки:\n{message.caption or ''}")
         elif message.content_type == 'audio':
-            bot.send_audio(user_id, message.audio.file_id, caption="✉️ Ответ поддержки")
+            bot.send_audio(user_id, message.audio.file_id, caption=f"✉️ Ответ поддержки:\n{message.caption or ''}")
         elif message.content_type == 'video':
-            bot.send_video(user_id, message.video.file_id, caption="✉️ Ответ поддержки")
+            bot.send_video(user_id, message.video.file_id, caption=f"✉️ Ответ поддержки:\n{message.caption or ''}")
         elif message.content_type == 'voice':
-            bot.send_voice(user_id, message.voice.file_id, caption="✉️ Ответ поддержки")
+            bot.send_voice(user_id, message.voice.file_id, caption=f"✉️ Ответ поддержки")
         elif message.content_type == 'sticker':
             bot.send_sticker(user_id, message.sticker.file_id)
             bot.send_message(user_id, "✉️ Ответ поддержки (стикер)")
