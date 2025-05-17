@@ -43,7 +43,7 @@ def handle_extend_command(message):
         if len(parts) <= 2:
             bot.reply_to(message, "Использование: /extend TG_ID PLAN DAYS")
             return
-
+        print(parts[1],parts[2],parts[3])
         tg_id = int(parts[1])
         plan = parts[2]
         days = int(parts[3])
