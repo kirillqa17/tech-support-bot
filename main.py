@@ -38,26 +38,38 @@ def send_welcome(message):
 @bot.message_handler(commands=['extend'], func=lambda message: message.from_user.id in ADMIN_IDS)
 def handle_extend_command(message):
     try:
-        # Разбиваем сообщение на части: /extend TG_ID
+        # Разбиваем сообщение на части: /extend TG_ID PLAN DAYS
         parts = message.text.split()
-        if len(parts) <= 2:
-            bot.reply_to(message, "Использование: /extend TG_ID PLAN DAYS")
+        if len(parts) != 4:
+            bot.reply_to(message, "Использование: /extend TG_ID PLAN DAYS\nПример: /extend 123456789 base 30")
             return
-        print(parts[1],parts[2],parts[3])
-        tg_id = int(parts[1])
+
+        tg_id = parts[1]  # Не конвертируем в int сразу, чтобы сохранить возможные ведущие нули
         plan = parts[2]
         days = int(parts[3])
+
+        # Проверяем, что tg_id состоит только из цифр
+        if not tg_id.isdigit():
+            raise ValueError("Telegram ID должен содержать только цифры")
+
+        print(f"Extending subscription for: {tg_id} {plan} {days}")  # Для отладки
+
         # Отправляем запрос на API для продления подписки
-        response = requests.post(f"{API_URL}/{tg_id}/extend", json={"days" : days, "plan" : plan})
+        response = requests.post(
+            f"{API_URL}/{tg_id}/extend",
+            json={"days": days, "plan": plan}
+        )
 
         if response.status_code == 200:
-            bot.reply_to(message, f"Подписка для пользователя с ID {tg_id} успешно продлена.")
+            bot.reply_to(message,
+                         f"✅ Подписка для пользователя с ID {tg_id} успешно продлена.\nПлан: {plan}\nДней: {days}")
         else:
-            bot.reply_to(message, f"Ошибка при продлении подписки: {response.text}")
-    except ValueError:
-        bot.reply_to(message, "Неверный формат ID. ID должен быть числом.")
+            bot.reply_to(message, f"❌ Ошибка при продлении подписки: {response.text}")
+
+    except ValueError as e:
+        bot.reply_to(message, f"❌ Ошибка в формате данных: {str(e)}")
     except Exception as e:
-        bot.reply_to(message, f"Произошла ошибка: {str(e)}")
+        bot.reply_to(message, f"⚠️ Произошла непредвиденная ошибка: {str(e)}")
 
 
 # Обработчик всех сообщений от пользователей
