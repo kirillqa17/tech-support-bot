@@ -52,7 +52,6 @@ def handle_extend_command(message):
         if not tg_id.isdigit():
             raise ValueError("Telegram ID должен содержать только цифры")
 
-        print(f"Extending subscription for: {tg_id} {plan} {days}")  # Для отладки
 
         # Отправляем запрос на API для продления подписки
         response = requests.patch(
@@ -83,18 +82,43 @@ def handle_user_message(message):
     user_data_cache[user_id] = username
 
     # Сохраняем информацию о сообщении
-    user_tickets[user_id].append({
+    msg_info = {
         "username": username,
         "message_id": message.message_id,
         "chat_id": message.chat.id,
         "content_type": message.content_type,
         "content": message  # Сохраняем все сообщение для последующей пересылки
-    })
+    }
+    user_tickets[user_id].append(msg_info)
 
-    # Добавляем в активные тикеты, если это первое сообщение
-    if user_id not in active_tickets:
+    # Уведомляем пользователя, что сообщение получено
+    bot.reply_to(message, "✅ Ваше сообщение получено и будет обработано в ближайшее время.")
+
+    # Если тикет уже активен (админ уже просматривает его)
+    if user_id in active_tickets:
+        # Пересылаем сообщение всем админам
+        for admin_id in ADMIN_IDS:
+            try:
+                # Пересылаем оригинальное сообщение
+                bot.forward_message(admin_id, msg_info['chat_id'], msg_info['message_id'])
+
+                # Добавляем кнопку для быстрого ответа
+                markup = types.InlineKeyboardMarkup()
+                markup.add(types.InlineKeyboardButton(
+                    text="Ответить",
+                    callback_data=f"view_ticket_{user_id}"
+                ))
+
+                bot.send_message(
+                    admin_id,
+                    f"📩 Новое сообщение в тикете от @{username} (ID: {user_id})",
+                    reply_markup=markup
+                )
+            except Exception as e:
+                print(f"Ошибка при пересылке сообщения админу {admin_id}: {e}")
+    else:
+        # Если это первое сообщение в тикете
         active_tickets.add(user_id)
-
         # Уведомляем админов о новом тикете
         for admin_id in ADMIN_IDS:
             try:
