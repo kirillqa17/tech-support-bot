@@ -70,6 +70,70 @@ def handle_extend_command(message):
     except Exception as e:
         bot.reply_to(message, f"⚠️ Произошла непредвиденная ошибка: {str(e)}")
 
+@bot.message_handler(commands=['info'], func=lambda message: message.from_user.id in ADMIN_IDS)
+def handle_extend_command(message):
+    try:
+        # Разбиваем сообщение на части: /extend TG_ID PLAN DAYS
+        parts = message.text.split()
+        if len(parts) != 2:
+            bot.reply_to(message, "Использование: /info TG_ID\nПример: /info 123456789")
+            return
+
+        tg_id = parts[1]  # Не конвертируем в int сразу, чтобы сохранить возможные ведущие нули
+
+        # Проверяем, что tg_id состоит только из цифр
+        if not tg_id.isdigit():
+            raise ValueError("Telegram ID должен содержать только цифры")
+
+
+        # Отправляем запрос на API для продления подписки
+        response = requests.get(
+            f"{API_URL}/{tg_id}/info"
+        )
+
+        if response.status_code == 200:
+            bot.reply_to(message,
+                         f"✅ Информация о пользователе {tg_id}\n"
+                         f"{response.json()}")
+        else:
+            bot.reply_to(message, f"❌ Ошибка при получении информации: {response.text}")
+
+    except ValueError as e:
+        bot.reply_to(message, f"❌ Ошибка в формате данных: {str(e)}")
+    except Exception as e:
+        bot.reply_to(message, f"⚠️ Произошла непредвиденная ошибка: {str(e)}")
+
+@bot.message_handler(commands=['disable_device_limit'], func=lambda message: message.from_user.id in ADMIN_IDS)
+def handle_extend_command(message):
+    try:
+        # Разбиваем сообщение на части: /extend TG_ID PLAN DAYS
+        parts = message.text.split()
+        if len(parts) != 2:
+            bot.reply_to(message, "Использование: /disable_device_limit TG_ID\nПример: /disable_device_limit 123456789")
+            return
+
+        tg_id = parts[1]  # Не конвертируем в int сразу, чтобы сохранить возможные ведущие нули
+
+        # Проверяем, что tg_id состоит только из цифр
+        if not tg_id.isdigit():
+            raise ValueError("Telegram ID должен содержать только цифры")
+
+
+        # Отправляем запрос на API для продления подписки
+        response = requests.get(
+            f"{API_URL}/{tg_id}/disable_device"
+        )
+
+        if response.status_code == 200:
+            bot.reply_to(message,
+                         f"✅ Лимит устройств на пользователя {tg_id} временно отключен")
+        else:
+            bot.reply_to(message, f"❌ Ошибка при получении информации: {response.text}")
+
+    except ValueError as e:
+        bot.reply_to(message, f"❌ Ошибка в формате данных: {str(e)}")
+    except Exception as e:
+        bot.reply_to(message, f"⚠️ Произошла непредвиденная ошибка: {str(e)}")
 
 # Обработчик всех сообщений от пользователей
 @bot.message_handler(func=lambda message: message.from_user.id not in ADMIN_IDS,
@@ -153,6 +217,33 @@ def show_active_tickets(message):
 
     bot.send_message(message.chat.id, "Активные тикеты:", reply_markup=markup)
 
+@bot.message_handler(commands=['help'], func=lambda message: message.from_user.id in ADMIN_IDS)
+def handle_help(message):
+    help_text = """
+<b>🛠 Список административных команд:</b>
+
+1. <b>/reply</b> - Показать активные тикеты
+2. <b>/extend TG_ID PLAN DAYS</b> - Продлить подписку
+   <i>Пример:</i> <code>/extend 123456789 base 30</code>
+
+3. <b>/info TG_ID</b> - Информация о пользователе
+   <i>Пример:</i> <code>/info 123456789</code>
+
+4. <b>/disable_device_limit TG_ID</b> - Отключить лимит устройств
+   <i>Пример:</i> <code>/disable_device_limit 123456789</code>
+
+5. <b>/help</b> - Эта справка
+
+<b>🔧 Работа с тикетами:</b>
+- Ответьте на сообщение с тикетом, чтобы отправить ответ пользователю
+- Используйте кнопку "Закрыть тикет" в интерфейсе просмотра тикета
+"""
+
+    bot.send_message(
+        chat_id=message.chat.id,
+        text=help_text,
+        parse_mode="HTML"
+    )
 
 @bot.callback_query_handler(func=lambda call: True)
 def callback_handler(call):
