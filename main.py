@@ -193,10 +193,10 @@ def handle_user_message(message):
                     reply_markup=types.InlineKeyboardMarkup().add(
                         types.InlineKeyboardButton(
                             text="Ответить",
-                            callback_data=f"view_ticket_{user_id}",
-                            parse_mode="HTML"
+                            callback_data=f"view_ticket_{user_id}"
                         )
-                    )
+                    ),
+                    parse_mode="HTML"
                 )
             except Exception as e:
                 print(f"Ошибка при уведомлении админа {admin_id}: {e}")
@@ -215,7 +215,6 @@ def show_active_tickets(message):
         markup.add(types.InlineKeyboardButton(
             text=f"@{username} (ID: <code>{user_id}</code>)",
             callback_data=f"view_ticket_{user_id}",
-            parse_mode="HTML"
         ))
 
     bot.send_message(message.chat.id, "Активные тикеты:", reply_markup=markup)
