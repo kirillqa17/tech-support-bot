@@ -175,8 +175,9 @@ def handle_user_message(message):
 
                 bot.send_message(
                     admin_id,
-                    f"📩 Новое сообщение в тикете от @{username} (ID: {user_id})",
-                    reply_markup=markup
+                    f"📩 Новое сообщение в тикете от @{username} (ID: <code>{user_id}</code>)",
+                    reply_markup=markup,
+                    parse_mode="HTML"
                 )
             except Exception as e:
                 print(f"Ошибка при пересылке сообщения админу {admin_id}: {e}")
@@ -188,11 +189,12 @@ def handle_user_message(message):
             try:
                 bot.send_message(
                     admin_id,
-                    f"📩 Новый тикет от @{username} (ID: {user_id})",
+                    f"📩 Новый тикет от @{username} (ID: <code>{user_id}</code>)",
                     reply_markup=types.InlineKeyboardMarkup().add(
                         types.InlineKeyboardButton(
                             text="Ответить",
-                            callback_data=f"view_ticket_{user_id}"
+                            callback_data=f"view_ticket_{user_id}",
+                            parse_mode="HTML"
                         )
                     )
                 )
@@ -211,8 +213,9 @@ def show_active_tickets(message):
     for user_id in active_tickets:
         username = user_data_cache.get(user_id, f"id{user_id}")
         markup.add(types.InlineKeyboardButton(
-            text=f"@{username} (ID: {user_id})",
-            callback_data=f"view_ticket_{user_id}"
+            text=f"@{username} (ID: <code>{user_id}</code>)",
+            callback_data=f"view_ticket_{user_id}",
+            parse_mode="HTML"
         ))
 
     bot.send_message(message.chat.id, "Активные тикеты:", reply_markup=markup)
@@ -279,8 +282,9 @@ def show_user_messages(admin_chat_id, user_id):
 
     bot.send_message(
         admin_chat_id,
-        f"Вы просматриваете тикет @{username} (ID: {user_id}). Ответьте на это сообщение, чтобы отправить ответ пользователю.",
-        reply_markup=markup
+        f"Вы просматриваете тикет @{username} (ID: <code>{user_id}</code>). Ответьте на это сообщение, чтобы отправить ответ пользователю.",
+        reply_markup=markup,
+        parse_mode='HTML'
     )
 
 
