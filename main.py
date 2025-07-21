@@ -86,7 +86,6 @@ def handle_extend_command(message):
             raise ValueError("Telegram ID должен содержать только цифры")
 
 
-        # Отправляем запрос на API для продления подписки
         response = requests.get(
             f"{API_URL}/{tg_id}/info"
         )
