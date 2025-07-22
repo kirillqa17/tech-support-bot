@@ -11,7 +11,7 @@ load_dotenv()
 # Получаем токен бота и список админов из .env
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 ADMIN_IDS = list(map(int, os.getenv('ADMIN_IDS').split(',')))
-API_URL = os.getenv('API_URL')  # URL вашего API для продления подписки
+API_URL = os.getenv('API_URL_SUPPORT')  # URL вашего API для продления подписки
 
 # Инициализируем бота
 bot = telebot.TeleBot(BOT_TOKEN)
