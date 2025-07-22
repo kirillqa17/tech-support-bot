@@ -3,7 +3,7 @@ import telebot
 from telebot import types
 from dotenv import load_dotenv
 from collections import defaultdict
-import requests  # Добавляем для работы с API
+import requests
 
 # Загружаем переменные из .env файла
 load_dotenv()
