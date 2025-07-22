@@ -9,7 +9,7 @@ import requests
 load_dotenv()
 
 # Получаем токен бота и список админов из .env
-BOT_TOKEN = os.getenv('BOT_TOKEN')
+BOT_TOKEN = os.getenv('BOT_TOKEN_SUPPORT')
 ADMIN_IDS = list(map(int, os.getenv('ADMIN_IDS').split(',')))
 API_URL = os.getenv('API_URL_SUPPORT')  # URL вашего API для продления подписки
 
