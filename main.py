@@ -1,176 +1,420 @@
 import os
+import logging
 import telebot
 from telebot import types
 from dotenv import load_dotenv
 from collections import defaultdict
+from datetime import datetime, timedelta
 import requests
 
 # Загружаем переменные из .env файла
 load_dotenv()
 
+# Настраиваем логирование
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s'
+)
+logger = logging.getLogger(__name__)
+
 # Получаем токен бота и список админов из .env
 BOT_TOKEN = os.getenv('BOT_TOKEN_SUPPORT')
 ADMIN_IDS = list(map(int, os.getenv('ADMIN_IDS').split(',')))
-API_URL = os.getenv('API_URL_SUPPORT')  # URL вашего API для продления подписки
+API_URL = os.getenv('API_URL_SUPPORT')
 
 # Инициализируем бота
 bot = telebot.TeleBot(BOT_TOKEN)
 
 # База данных для хранения сообщений пользователей
-user_tickets = defaultdict(list)  # {user_id: [{"username": str, "message_id": int, "chat_id": int}]}
-active_tickets = set()  # Множество активных тикетов (user_id)
-user_data_cache = {}  # Кэш для хранения username пользователей {user_id: username}
-pending_messages = defaultdict(list)  # {user_id: [message1, message2, ...]}
+user_tickets = defaultdict(list)
+active_tickets = set()
+user_data_cache = {}
+pending_messages = defaultdict(list)
+
+# Маппинг планов
+PLAN_NAMES = {
+    "base": "Base",
+    "bsbase": "BS Base",
+    "family": "Family",
+    "bsfamily": "BS Family",
+    "trial": "Trial",
+    "free": "Free",
+}
+
+VALID_PLANS = list(PLAN_NAMES.keys())
+
+# Маппинг сквадов
+SQUAD_NAMES = {
+    "514a5e22-c599-4f72-81a5-e646f0391db7": "Default",
+    "9e60626e-32a8-4d91-a2f8-2aa3fecf7b23": "BS",
+    "b6a4e86b-b769-4c86-a2d9-f31bbe645029": "PRO",
+}
 
 
-# Обработчик команды /start
+def format_subscription_end(sub_end_str):
+    """Форматирует дату окончания подписки в МСК"""
+    try:
+        dt_object = datetime.fromisoformat(sub_end_str.replace("Z", "+00:00"))
+        dt_object_moscow = dt_object + timedelta(hours=3)
+        return dt_object_moscow.strftime("%d.%m.%Y, %H:%M МСК")
+    except Exception:
+        return sub_end_str
+
+
+def get_squad_name(uuid):
+    """Возвращает имя сквада по UUID"""
+    return SQUAD_NAMES.get(uuid, uuid)
+
+
+# ===== КОМАНДЫ =====
+
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
     if message.from_user.id in ADMIN_IDS:
+        logger.info(f"Admin {message.from_user.id} started the bot")
         bot.send_message(message.chat.id,
-                         "Вы админ. Используйте /reply для ответа на сообщения или /extend для продления подписки.")
+                         "Вы админ. Используйте /help для списка команд.")
     else:
+        logger.info(f"User {message.from_user.id} started the bot")
         bot.reply_to(message,
                      "Привет! Это бот техподдержки SvoiVPN. Напишите ваш вопрос, и мы обязательно вам ответим в скором времени!")
 
 
-# Обработчик команды /extend для админов
-@bot.message_handler(commands=['extend'], func=lambda message: message.from_user.id in ADMIN_IDS)
-def handle_extend_command(message):
+@bot.message_handler(commands=['help'], func=lambda message: message.from_user.id in ADMIN_IDS)
+def handle_help(message):
+    logger.info(f"Admin {message.from_user.id} requested /help")
+    help_text = """
+<b>🛠 Список административных команд:</b>
+
+<b>📋 Информация:</b>
+1. <b>/info TG_ID</b> — Подробная информация о пользователе
+   <i>Пример:</i> <code>/info 123456789</code>
+
+2. <b>/squads TG_ID</b> — Текущие сквады пользователя (из Remnawave)
+   <i>Пример:</i> <code>/squads 123456789</code>
+
+<b>⚙️ Управление подпиской:</b>
+3. <b>/extend TG_ID PLAN DAYS</b> — Продлить подписку
+   <i>Пример:</i> <code>/extend 123456789 base 30</code>
+   <i>Планы:</i> base, bsbase, family, bsfamily, trial, free
+
+4. <b>/toggle_pro TG_ID on|off</b> — Включить/выключить PRO режим
+   <i>Пример:</i> <code>/toggle_pro 123456789 on</code>
+   <i>PRO добавляет:</i> XHTTP, gRPC, Trojan, Shadowsocks
+
+5. <b>/disable_device_limit TG_ID</b> — Отключить лимит устройств
+   <i>Пример:</i> <code>/disable_device_limit 123456789</code>
+
+<b>🎫 Тикеты:</b>
+6. <b>/reply</b> — Показать активные тикеты
+7. Ответьте на сообщение тикета, чтобы отправить ответ пользователю
+8. Используйте кнопку «Закрыть тикет» для завершения
+
+<b>/help</b> — Эта справка
+"""
+    bot.send_message(chat_id=message.chat.id, text=help_text, parse_mode="HTML")
+
+
+@bot.message_handler(commands=['info'], func=lambda message: message.from_user.id in ADMIN_IDS)
+def handle_info(message):
     try:
-        # Разбиваем сообщение на части: /extend TG_ID PLAN DAYS
         parts = message.text.split()
-        if len(parts) != 4:
-            bot.reply_to(message, "Использование: /extend TG_ID PLAN DAYS\nПример: /extend 123456789 base 30")
+        if len(parts) != 2:
+            bot.reply_to(message, "Использование: /info TG_ID\nПример: /info 123456789")
             return
 
-        tg_id = parts[1]  # Не конвертируем в int сразу, чтобы сохранить возможные ведущие нули
-        plan = parts[2]
-        days = int(parts[3])
-
-        # Проверяем, что tg_id состоит только из цифр
+        tg_id = parts[1]
         if not tg_id.isdigit():
             raise ValueError("Telegram ID должен содержать только цифры")
 
+        logger.info(f"Admin {message.from_user.id} requested /info for {tg_id}")
 
-        # Отправляем запрос на API для продления подписки
+        response = requests.get(f"{API_URL}/{tg_id}/info")
+
+        if response.status_code == 200:
+            user = response.json()
+
+            plan = user.get("plan", "—")
+            plan_display = PLAN_NAMES.get(plan, plan)
+            is_pro = user.get("is_pro", False)
+            sub_end = format_subscription_end(user.get("subscription_end", "—"))
+            is_active = "Активна" if user.get("is_active") == 1 else "Неактивна"
+            username = user.get("username") or "—"
+            referrals = user.get("referrals") or []
+            referral_id = user.get("referral_id") or "—"
+            device_limit = user.get("device_limit", "—")
+            auto_renew = user.get("auto_renew", False)
+            payed_refs = user.get("payed_refs", 0)
+            is_used_trial = user.get("is_used_trial", False)
+
+            text = f"""<b>📋 Информация о пользователе</b>
+
+<b>ID:</b> <code>{tg_id}</code>
+<b>Username:</b> @{username}
+<b>UUID:</b> <code>{user.get("uuid", "—")}</code>
+
+<b>📊 Подписка:</b>
+  Тариф: <b>{plan_display}</b>
+  PRO режим: {"⚡ Включён" if is_pro else "❌ Выключен"}
+  Статус: {is_active}
+  Окончание: {sub_end}
+  Автопродление: {"✅ Да" if auto_renew else "❌ Нет"}
+
+<b>🔧 Настройки:</b>
+  Лимит устройств: {device_limit}
+  Триал использован: {"Да" if is_used_trial else "Нет"}
+
+<b>👥 Рефералы:</b>
+  Приглашён: {referral_id}
+  Приглашённые: {len(referrals)} чел.
+  Оплаченные рефы: {payed_refs}
+
+<b>🔗 Ссылка на подписку:</b>
+<code>{user.get("sub_link", "—")}</code>"""
+
+            bot.reply_to(message, text, parse_mode="HTML")
+        elif response.status_code == 404:
+            bot.reply_to(message, f"❌ Пользователь {tg_id} не найден")
+        else:
+            bot.reply_to(message, f"❌ Ошибка: {response.status_code} — {response.text}")
+
+    except ValueError as e:
+        bot.reply_to(message, f"❌ Ошибка: {str(e)}")
+    except Exception as e:
+        logger.error(f"Error in /info: {e}")
+        bot.reply_to(message, f"⚠️ Произошла ошибка: {str(e)}")
+
+
+@bot.message_handler(commands=['squads'], func=lambda message: message.from_user.id in ADMIN_IDS)
+def handle_squads(message):
+    try:
+        parts = message.text.split()
+        if len(parts) != 2:
+            bot.reply_to(message, "Использование: /squads TG_ID\nПример: /squads 123456789")
+            return
+
+        tg_id = parts[1]
+        if not tg_id.isdigit():
+            raise ValueError("Telegram ID должен содержать только цифры")
+
+        logger.info(f"Admin {message.from_user.id} requested /squads for {tg_id}")
+
+        response = requests.get(f"{API_URL}/{tg_id}/squads")
+
+        if response.status_code == 200:
+            data = response.json()
+            squads = data.get("squads", [])
+
+            if not squads:
+                bot.reply_to(message, f"У пользователя {tg_id} нет назначенных сквадов.")
+                return
+
+            lines = [f"<b>🏷 Сквады пользователя {tg_id}:</b>\n"]
+            for s in squads:
+                uuid = s.get("uuid", "—")
+                tag = s.get("tag", "—")
+                name = get_squad_name(uuid)
+                lines.append(f"  • <b>{name}</b> ({tag})\n    <code>{uuid}</code>")
+
+            bot.reply_to(message, "\n".join(lines), parse_mode="HTML")
+        else:
+            bot.reply_to(message, f"❌ Ошибка: {response.status_code} — {response.text}")
+
+    except ValueError as e:
+        bot.reply_to(message, f"❌ Ошибка: {str(e)}")
+    except Exception as e:
+        logger.error(f"Error in /squads: {e}")
+        bot.reply_to(message, f"⚠️ Произошла ошибка: {str(e)}")
+
+
+@bot.message_handler(commands=['extend'], func=lambda message: message.from_user.id in ADMIN_IDS)
+def handle_extend(message):
+    try:
+        parts = message.text.split()
+        if len(parts) != 4:
+            plans_list = ", ".join(VALID_PLANS)
+            bot.reply_to(message,
+                         f"Использование: /extend TG_ID PLAN DAYS\n"
+                         f"Пример: /extend 123456789 base 30\n\n"
+                         f"Доступные планы: {plans_list}\n\n"
+                         f"<b>Сквады по планам:</b>\n"
+                         f"  base, family, trial, free → Default\n"
+                         f"  bsbase, bsfamily → Default + BS\n"
+                         f"  + PRO режим → + PRO сквад",
+                         parse_mode="HTML")
+            return
+
+        tg_id = parts[1]
+        plan = parts[2].lower()
+        days = int(parts[3])
+
+        if not tg_id.isdigit():
+            raise ValueError("Telegram ID должен содержать только цифры")
+
+        if plan not in VALID_PLANS:
+            plans_list = ", ".join(VALID_PLANS)
+            bot.reply_to(message, f"❌ Неизвестный план '{plan}'.\nДоступные: {plans_list}")
+            return
+
+        if days <= 0:
+            raise ValueError("Количество дней должно быть больше 0")
+
+        logger.info(f"Admin {message.from_user.id} extending {tg_id}: plan={plan}, days={days}")
+
         response = requests.patch(
             f"{API_URL}/{tg_id}/extend",
             json={"days": days, "plan": plan}
         )
 
         if response.status_code == 200:
-            bot.reply_to(message,
-                         f"✅ Подписка для пользователя с ID {tg_id} успешно продлена.\nПлан: {plan}\nДней: {days}")
+            plan_display = PLAN_NAMES.get(plan, plan)
+            squads_info = "Default"
+            if plan.startswith("bs"):
+                squads_info = "Default + BS"
+
+            text = (f"✅ Подписка продлена\n\n"
+                    f"<b>ID:</b> <code>{tg_id}</code>\n"
+                    f"<b>План:</b> {plan_display}\n"
+                    f"<b>Дней:</b> {days}\n"
+                    f"<b>Сквады:</b> {squads_info}")
+            bot.reply_to(message, text, parse_mode="HTML")
+        elif response.status_code == 404:
+            bot.reply_to(message, f"❌ Пользователь {tg_id} не найден")
         else:
-            bot.reply_to(message, f"❌ Ошибка при продлении подписки: {response.text}")
+            bot.reply_to(message, f"❌ Ошибка: {response.text}")
 
     except ValueError as e:
-        bot.reply_to(message, f"❌ Ошибка в формате данных: {str(e)}")
+        bot.reply_to(message, f"❌ Ошибка: {str(e)}")
     except Exception as e:
-        bot.reply_to(message, f"⚠️ Произошла непредвиденная ошибка: {str(e)}")
+        logger.error(f"Error in /extend: {e}")
+        bot.reply_to(message, f"⚠️ Произошла ошибка: {str(e)}")
 
-@bot.message_handler(commands=['info'], func=lambda message: message.from_user.id in ADMIN_IDS)
-def handle_extend_command(message):
+
+@bot.message_handler(commands=['toggle_pro'], func=lambda message: message.from_user.id in ADMIN_IDS)
+def handle_toggle_pro(message):
     try:
-        # Разбиваем сообщение на части: /extend TG_ID PLAN DAYS
         parts = message.text.split()
-        if len(parts) != 2:
-            bot.reply_to(message, "Использование: /info TG_ID\nПример: /info 123456789")
+        if len(parts) != 3:
+            bot.reply_to(message,
+                         "Использование: /toggle_pro TG_ID on|off\n"
+                         "Пример: /toggle_pro 123456789 on\n\n"
+                         "PRO режим добавляет протоколы: XHTTP, gRPC, Trojan, Shadowsocks")
             return
 
-        tg_id = parts[1]  # Не конвертируем в int сразу, чтобы сохранить возможные ведущие нули
+        tg_id = parts[1]
+        action = parts[2].lower()
 
-        # Проверяем, что tg_id состоит только из цифр
         if not tg_id.isdigit():
             raise ValueError("Telegram ID должен содержать только цифры")
 
+        if action not in ("on", "off"):
+            bot.reply_to(message, "❌ Укажите on или off.\nПример: /toggle_pro 123456789 on")
+            return
 
-        response = requests.get(
-            f"{API_URL}/{tg_id}/info"
+        enable = action == "on"
+        logger.info(f"Admin {message.from_user.id} toggle PRO for {tg_id}: enable={enable}")
+
+        response = requests.patch(
+            f"{API_URL}/{tg_id}/pro",
+            json={"is_pro": enable}
         )
 
         if response.status_code == 200:
+            status = "⚡ Включён" if enable else "❌ Выключен"
             bot.reply_to(message,
-                         f"✅ Информация о пользователе {tg_id}\n"
-                         f"{response.json()}")
+                         f"✅ PRO режим для <code>{tg_id}</code>: {status}",
+                         parse_mode="HTML")
+        elif response.status_code == 404:
+            bot.reply_to(message, f"❌ Пользователь {tg_id} не найден")
         else:
-            bot.reply_to(message, f"❌ Ошибка при получении информации: {response.text}")
+            bot.reply_to(message, f"❌ Ошибка: {response.text}")
 
     except ValueError as e:
-        bot.reply_to(message, f"❌ Ошибка в формате данных: {str(e)}")
+        bot.reply_to(message, f"❌ Ошибка: {str(e)}")
     except Exception as e:
-        bot.reply_to(message, f"⚠️ Произошла непредвиденная ошибка: {str(e)}")
+        logger.error(f"Error in /toggle_pro: {e}")
+        bot.reply_to(message, f"⚠️ Произошла ошибка: {str(e)}")
+
 
 @bot.message_handler(commands=['disable_device_limit'], func=lambda message: message.from_user.id in ADMIN_IDS)
-def handle_extend_command(message):
+def handle_disable_device_limit(message):
     try:
-        # Разбиваем сообщение на части: /extend TG_ID PLAN DAYS
         parts = message.text.split()
         if len(parts) != 2:
             bot.reply_to(message, "Использование: /disable_device_limit TG_ID\nПример: /disable_device_limit 123456789")
             return
 
-        tg_id = parts[1]  # Не конвертируем в int сразу, чтобы сохранить возможные ведущие нули
-
-        # Проверяем, что tg_id состоит только из цифр
+        tg_id = parts[1]
         if not tg_id.isdigit():
             raise ValueError("Telegram ID должен содержать только цифры")
 
+        logger.info(f"Admin {message.from_user.id} disabling device limit for {tg_id}")
 
-        response = requests.get(
-            f"{API_URL}/{tg_id}/disable_device"
+        response = requests.post(
+            f"{API_URL}/{tg_id}/disable_device",
+            headers={"Content-Type": "application/json"}
         )
 
         if response.status_code == 200:
-            bot.reply_to(message,
-                         f"✅ Лимит устройств на пользователя {tg_id} временно отключен")
+            bot.reply_to(message, f"✅ Лимит устройств для <code>{tg_id}</code> временно отключен", parse_mode="HTML")
         else:
-            bot.reply_to(message, f"❌ Ошибка при получении информации: {response.text}")
+            bot.reply_to(message, f"❌ Ошибка: {response.text}")
 
     except ValueError as e:
-        bot.reply_to(message, f"❌ Ошибка в формате данных: {str(e)}")
+        bot.reply_to(message, f"❌ Ошибка: {str(e)}")
     except Exception as e:
-        bot.reply_to(message, f"⚠️ Произошла непредвиденная ошибка: {str(e)}")
+        logger.error(f"Error in /disable_device_limit: {e}")
+        bot.reply_to(message, f"⚠️ Произошла ошибка: {str(e)}")
 
-# Обработчик всех сообщений от пользователей
+
+# ===== ТИКЕТЫ =====
+
+@bot.message_handler(commands=['reply'], func=lambda message: message.from_user.id in ADMIN_IDS)
+def show_active_tickets(message):
+    logger.info(f"Admin {message.from_user.id} requested /reply")
+    if not active_tickets:
+        bot.reply_to(message, "Нет активных тикетов.")
+        return
+
+    markup = types.InlineKeyboardMarkup()
+    for user_id in active_tickets:
+        username = user_data_cache.get(user_id, f"id{user_id}")
+        markup.add(types.InlineKeyboardButton(
+            text=f"@{username} (ID: {user_id})",
+            callback_data=f"view_ticket_{user_id}",
+        ))
+
+    bot.send_message(message.chat.id, "Активные тикеты:", reply_markup=markup)
+
+
 @bot.message_handler(func=lambda message: message.from_user.id not in ADMIN_IDS,
                      content_types=['text', 'photo', 'document', 'audio', 'video', 'voice', 'sticker'])
 def handle_user_message(message):
     user_id = message.from_user.id
     username = message.from_user.username or f"id{user_id}"
 
-    # Сохраняем username в кэш
     user_data_cache[user_id] = username
 
-    # Сохраняем информацию о сообщении
     msg_info = {
         "username": username,
         "message_id": message.message_id,
         "chat_id": message.chat.id,
         "content_type": message.content_type,
-        "content": message  # Сохраняем все сообщение для последующей пересылки
+        "content": message
     }
     user_tickets[user_id].append(msg_info)
 
-    # Уведомляем пользователя, что сообщение получено
     bot.reply_to(message, "✅ Ваше сообщение получено и будет обработано в ближайшее время.")
 
-    # Если тикет уже активен (админ уже просматривает его)
     if user_id in active_tickets:
-        # Пересылаем сообщение всем админам
         for admin_id in ADMIN_IDS:
             try:
-                # Пересылаем оригинальное сообщение
                 bot.forward_message(admin_id, msg_info['chat_id'], msg_info['message_id'])
-
-                # Добавляем кнопку для быстрого ответа
                 markup = types.InlineKeyboardMarkup()
                 markup.add(types.InlineKeyboardButton(
                     text="Ответить",
                     callback_data=f"view_ticket_{user_id}"
                 ))
-
                 bot.send_message(
                     admin_id,
                     f"📩 Новое сообщение в тикете от @{username} (ID: <code>{user_id}</code>)",
@@ -178,11 +422,10 @@ def handle_user_message(message):
                     parse_mode="HTML"
                 )
             except Exception as e:
-                print(f"Ошибка при пересылке сообщения админу {admin_id}: {e}")
+                logger.error(f"Error forwarding message to admin {admin_id}: {e}")
     else:
-        # Если это первое сообщение в тикете
         active_tickets.add(user_id)
-        # Уведомляем админов о новом тикете
+        logger.info(f"New ticket from @{username} (ID: {user_id})")
         for admin_id in ADMIN_IDS:
             try:
                 bot.send_message(
@@ -197,53 +440,8 @@ def handle_user_message(message):
                     parse_mode="HTML"
                 )
             except Exception as e:
-                print(f"Ошибка при уведомлении админа {admin_id}: {e}")
+                logger.error(f"Error notifying admin {admin_id}: {e}")
 
-
-# Обработчик команды /reply для админов
-@bot.message_handler(commands=['reply'], func=lambda message: message.from_user.id in ADMIN_IDS)
-def show_active_tickets(message):
-    if not active_tickets:
-        bot.reply_to(message, "Нет активных тикетов.")
-        return
-
-    markup = types.InlineKeyboardMarkup()
-    for user_id in active_tickets:
-        username = user_data_cache.get(user_id, f"id{user_id}")
-        markup.add(types.InlineKeyboardButton(
-            text=f"@{username} (ID: <code>{user_id}</code>)",
-            callback_data=f"view_ticket_{user_id}",
-        ))
-
-    bot.send_message(message.chat.id, "Активные тикеты:", reply_markup=markup)
-
-@bot.message_handler(commands=['help'], func=lambda message: message.from_user.id in ADMIN_IDS)
-def handle_help(message):
-    help_text = """
-<b>🛠 Список административных команд:</b>
-
-1. <b>/reply</b> - Показать активные тикеты
-2. <b>/extend TG_ID PLAN DAYS</b> - Продлить подписку
-   <i>Пример:</i> <code>/extend 123456789 base 30</code>
-
-3. <b>/info TG_ID</b> - Информация о пользователе
-   <i>Пример:</i> <code>/info 123456789</code>
-
-4. <b>/disable_device_limit TG_ID</b> - Отключить лимит устройств
-   <i>Пример:</i> <code>/disable_device_limit 123456789</code>
-
-5. <b>/help</b> - Эта справка
-
-<b>🔧 Работа с тикетами:</b>
-- Ответьте на сообщение с тикетом, чтобы отправить ответ пользователю
-- Используйте кнопку "Закрыть тикет" в интерфейсе просмотра тикета
-"""
-
-    bot.send_message(
-        chat_id=message.chat.id,
-        text=help_text,
-        parse_mode="HTML"
-    )
 
 @bot.callback_query_handler(func=lambda call: True)
 def callback_handler(call):
@@ -262,15 +460,12 @@ def show_user_messages(admin_chat_id, user_id):
 
     username = user_data_cache.get(user_id, f"id{user_id}")
 
-    # Пересылаем все сообщения пользователя
     for msg_info in user_tickets[user_id]:
         try:
-            # Пересылаем оригинальное сообщение
             bot.forward_message(admin_chat_id, msg_info['chat_id'], msg_info['message_id'])
         except Exception as e:
-            print(f"Ошибка при пересылке сообщения: {e}")
+            logger.error(f"Error forwarding message: {e}")
 
-    # Кнопка для закрытия тикета
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton(
         text="Закрыть тикет",
@@ -288,15 +483,14 @@ def show_user_messages(admin_chat_id, user_id):
 def close_ticket(admin_chat_id, user_id):
     if user_id in active_tickets:
         active_tickets.remove(user_id)
-        # Очищаем историю сообщений при закрытии тикета
         if user_id in user_tickets:
             del user_tickets[user_id]
+        logger.info(f"Ticket closed for user {user_id}")
         bot.send_message(admin_chat_id, "Тикет закрыт.")
     else:
         bot.send_message(admin_chat_id, "Тикет уже закрыт или не существует.")
 
 
-# Обработчик ответов админов
 @bot.message_handler(func=lambda message: message.reply_to_message is not None and
                                           message.from_user.id in ADMIN_IDS,
                      content_types=['text', 'photo', 'document', 'audio', 'video', 'voice', 'sticker'])
@@ -305,17 +499,14 @@ def handle_admin_reply(message):
     if not reply_text or "Вы просматриваете тикет @" not in reply_text:
         return
 
-    # Получаем user_id из текста сообщения
     try:
         user_id = int(reply_text.split("(ID: ")[1].split(")")[0])
     except (IndexError, ValueError):
         bot.reply_to(message, "Не удалось определить ID пользователя.")
         return
 
-    # Получаем username из кэша
     username = user_data_cache.get(user_id, f"id{user_id}")
 
-    # Отправляем ответ пользователю
     try:
         if message.content_type == 'text':
             bot.send_message(user_id, f"✉️ Ответ поддержки:\n{message.text}")
@@ -334,11 +525,14 @@ def handle_admin_reply(message):
             bot.send_sticker(user_id, message.sticker.file_id)
             bot.send_message(user_id, "✉️ Ответ поддержки (стикер)")
 
+        logger.info(f"Admin {message.from_user.id} replied to user {user_id}")
         bot.reply_to(message, f"Ответ отправлен пользователю @{username}.")
     except Exception as e:
+        logger.error(f"Error sending reply to user {user_id}: {e}")
         bot.reply_to(message, f"Ошибка при отправке ответа: {e}")
 
 
 # Запускаем бота
 if __name__ == '__main__':
+    logger.info("Tech support bot starting...")
     bot.infinity_polling()
