@@ -212,9 +212,8 @@ def handle_squads(message):
             lines = [f"<b>🏷 Сквады пользователя {tg_id}:</b>\n"]
             for s in squads:
                 uuid = s.get("uuid", "—")
-                tag = s.get("tag", "—")
-                name = get_squad_name(uuid)
-                lines.append(f"  • <b>{name}</b> ({tag})\n    <code>{uuid}</code>")
+                name = s.get("name", get_squad_name(uuid))
+                lines.append(f"  • <b>{name}</b>\n    <code>{uuid}</code>")
 
             bot.reply_to(message, "\n".join(lines), parse_mode="HTML")
         else:
