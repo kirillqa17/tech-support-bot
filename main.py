@@ -105,6 +105,10 @@ def handle_help(message):
 5. <b>/disable_device_limit TG_ID</b> — Отключить лимит устройств
    <i>Пример:</i> <code>/disable_device_limit 123456789</code>
 
+6. <b>/compensate DAYS</b> — Начислить компенсацию всем активным юзерам
+   <i>Пример:</i> <code>/compensate 7</code>
+   Продлит подписку на N дней по текущему тарифу каждого юзера
+
 <b>🎫 Тикеты:</b>
 6. <b>/reply</b> — Показать активные тикеты
 7. Ответьте на сообщение тикета, чтобы отправить ответ пользователю
@@ -363,6 +367,81 @@ def handle_disable_device_limit(message):
         bot.reply_to(message, f"❌ Ошибка: {str(e)}")
     except Exception as e:
         logger.error(f"Error in /disable_device_limit: {e}")
+        bot.reply_to(message, f"⚠️ Произошла ошибка: {str(e)}")
+
+
+@bot.message_handler(commands=['compensate'], func=lambda message: message.from_user.id in ADMIN_IDS)
+def handle_compensate(message):
+    try:
+        parts = message.text.split()
+        if len(parts) != 2:
+            bot.reply_to(message, "Использование: /compensate DAYS\nПример: /compensate 7")
+            return
+
+        days = int(parts[1])
+        if days <= 0:
+            raise ValueError("Количество дней должно быть больше 0")
+
+        logger.info(f"Admin {message.from_user.id} starting compensation: {days} days")
+
+        # Получаем список активных юзеров
+        response = requests.get(f"{API_URL.rsplit('/', 1)[0]}/users/active")
+        if response.status_code != 200:
+            bot.reply_to(message, f"❌ Не удалось получить список пользователей: {response.text}")
+            return
+
+        users = response.json()
+        total = len(users)
+        if total == 0:
+            bot.reply_to(message, "Нет активных пользователей.")
+            return
+
+        status_msg = bot.reply_to(message,
+                                  f"⏳ Начисляю компенсацию {days} дн. для {total} активных пользователей...")
+
+        success = 0
+        failed = 0
+        skipped = 0
+
+        for user in users:
+            tg_id = user.get("telegram_id")
+            plan = user.get("plan", "")
+
+            # Пропускаем trial и free — нечего компенсировать
+            if plan in ("trial", "free", ""):
+                skipped += 1
+                continue
+
+            try:
+                r = requests.patch(
+                    f"{API_URL}/{tg_id}/extend",
+                    json={"days": days, "plan": plan}
+                )
+                if r.status_code == 200:
+                    success += 1
+                else:
+                    failed += 1
+                    logger.warning(f"Compensate failed for {tg_id}: {r.status_code} {r.text}")
+            except Exception as e:
+                failed += 1
+                logger.error(f"Compensate error for {tg_id}: {e}")
+
+        result_text = (
+            f"✅ Компенсация завершена!\n\n"
+            f"<b>Дней:</b> {days}\n"
+            f"<b>Всего активных:</b> {total}\n"
+            f"<b>Успешно:</b> {success}\n"
+            f"<b>Пропущено (trial/free):</b> {skipped}\n"
+            f"<b>Ошибки:</b> {failed}"
+        )
+
+        logger.info(f"Compensation done: {success} success, {skipped} skipped, {failed} failed")
+        bot.edit_message_text(result_text, message.chat.id, status_msg.message_id, parse_mode="HTML")
+
+    except ValueError as e:
+        bot.reply_to(message, f"❌ Ошибка: {str(e)}")
+    except Exception as e:
+        logger.error(f"Error in /compensate: {e}")
         bot.reply_to(message, f"⚠️ Произошла ошибка: {str(e)}")
 
 
