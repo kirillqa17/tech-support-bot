@@ -208,6 +208,47 @@ def create_admin_ticket(user_id: int, username: str, reason: str = ""):
             logger.error(f"Error sending ticket to admin {admin_id}: {e}")
 
 
+def peek_conversation(admin_chat_id: int, user_id: int):
+    """Просмотр переписки юзера с ИИ (без создания тикета, read-only)."""
+    username = user_data_cache.get(user_id, f"id{user_id}")
+    conversation = user_conversation.get(user_id, [])
+
+    if not conversation:
+        bot.send_message(admin_chat_id, "Нет сохранённых сообщений.")
+        return
+
+    bot.send_message(
+        admin_chat_id,
+        f"👁 <b>Просмотр диалога @{username} ({user_id}):</b>",
+        parse_mode="HTML"
+    )
+
+    for chat_id, msg_id in conversation:
+        try:
+            bot.forward_message(admin_chat_id, chat_id, msg_id)
+        except Exception as e:
+            logger.error(f"Error forwarding msg {msg_id}: {e}")
+
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton(
+            text="💬 Ответить пользователю",
+            callback_data=f"open_ticket_{user_id}"
+        ),
+        types.InlineKeyboardButton(
+            text="✅ Всё ок",
+            callback_data=f"peek_done"
+        )
+    )
+
+    bot.send_message(
+        admin_chat_id,
+        f"👆 Диалог @{username} (ID: <code>{user_id}</code>) — {len(conversation)} сообщ.",
+        reply_markup=markup,
+        parse_mode="HTML"
+    )
+
+
 def open_ticket_conversation(admin_chat_id: int, user_id: int):
     """Пересылает админу всю переписку с юзером и предлагает ответить."""
     username = user_data_cache.get(user_id, f"id{user_id}")
@@ -325,10 +366,14 @@ def handle_help(message):
    <i>Пример:</i> <code>/compensate 7</code>
    Продлит подписку на N дней по текущему тарифу каждого юзера
 
+<b>💬 Мониторинг:</b>
+7. <b>/chats</b> — Просмотр всех диалогов юзеров с ИИ
+   Можно читать переписку и при необходимости вмешаться
+
 <b>🎫 Тикеты:</b>
-7. <b>/reply</b> — Показать активные тикеты
-8. Ответьте (reply) на сообщение тикета, чтобы отправить ответ пользователю
-9. Используйте кнопку «Закрыть тикет» для завершения
+8. <b>/reply</b> — Показать активные тикеты (эскалации)
+9. Ответьте (reply) на сообщение тикета, чтобы отправить ответ пользователю
+10. Используйте кнопку «Закрыть тикет» для завершения
 
 <b>/help</b> — Эта справка
 """
@@ -660,6 +705,29 @@ def handle_compensate(message):
         bot.reply_to(message, f"⚠️ Произошла ошибка: {str(e)}")
 
 
+# ===== МОНИТОРИНГ ЧАТОВ =====
+
+@bot.message_handler(commands=['chats'], func=lambda message: message.from_user.id in ADMIN_IDS)
+def show_active_chats(message):
+    """Показывает всех юзеров с активными диалогами — для мониторинга без тикетов."""
+    logger.info(f"Admin {message.from_user.id} requested /chats")
+    if not user_conversation:
+        bot.reply_to(message, "Нет активных диалогов.")
+        return
+
+    markup = types.InlineKeyboardMarkup()
+    for user_id in sorted(user_conversation.keys(), key=lambda uid: len(user_conversation[uid]), reverse=True):
+        username = user_data_cache.get(user_id, f"id{user_id}")
+        msg_count = len(user_conversation[user_id])
+        is_ticket = "🎫 " if user_id in active_tickets else ""
+        markup.add(types.InlineKeyboardButton(
+            text=f"{is_ticket}@{username} ({msg_count} сообщ.)",
+            callback_data=f"peek_{user_id}",
+        ))
+
+    bot.send_message(message.chat.id, "💬 Активные диалоги с ИИ:", reply_markup=markup)
+
+
 # ===== ТИКЕТЫ =====
 
 @bot.message_handler(commands=['reply'], func=lambda message: message.from_user.id in ADMIN_IDS)
@@ -787,7 +855,11 @@ def handle_user_media_message(message):
 
 @bot.callback_query_handler(func=lambda call: True)
 def callback_handler(call):
-    if call.data.startswith('open_ticket_'):
+    if call.data.startswith('peek_'):
+        user_id = int(call.data.split('_')[-1])
+        bot.answer_callback_query(call.id, text="Загружаю переписку...")
+        peek_conversation(call.message.chat.id, user_id)
+    elif call.data.startswith('open_ticket_'):
         user_id = int(call.data.split('_')[-1])
         bot.answer_callback_query(call.id, text="Загружаю переписку...")
         open_ticket_conversation(call.message.chat.id, user_id)
@@ -795,6 +867,12 @@ def callback_handler(call):
         user_id = int(call.data.split('_')[-1])
         bot.answer_callback_query(call.id, text="Загружаю...")
         open_ticket_conversation(call.message.chat.id, user_id)
+    elif call.data == 'peek_done':
+        bot.answer_callback_query(call.id, text="👍")
+        try:
+            bot.delete_message(call.message.chat.id, call.message.message_id)
+        except Exception:
+            pass
     elif call.data.startswith('close_ticket_'):
         user_id = int(call.data.split('_')[-1])
         close_ticket(call.message.chat.id, user_id)
