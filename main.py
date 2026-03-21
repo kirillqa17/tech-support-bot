@@ -6,6 +6,7 @@ from dotenv import load_dotenv
 from collections import defaultdict
 from datetime import datetime, timedelta
 import requests
+import tempfile
 
 # Загружаем переменные из .env файла
 load_dotenv()
@@ -22,15 +23,17 @@ BOT_TOKEN = os.getenv('BOT_TOKEN_SUPPORT')
 ADMIN_IDS = list(map(int, os.getenv('ADMIN_IDS').split(',')))
 API_URL = os.getenv('API_URL_SUPPORT')
 SUPPORT_API_URL = os.getenv('SUPPORT_API_URL', 'http://vpn-api:8080')
+PROXYAPI_KEY = os.getenv('PROXYAPI_KEY', '')
 
 # Инициализируем бота
 bot = telebot.TeleBot(BOT_TOKEN)
 
-# База данных для хранения сообщений пользователей
-user_tickets = defaultdict(list)
-active_tickets = set()
-user_data_cache = {}
-pending_messages = defaultdict(list)
+# Тикет-система
+user_tickets = defaultdict(list)  # user_id -> [msg_info, ...]
+active_tickets = set()  # set of user_ids with open tickets
+user_data_cache = {}  # user_id -> username
+# Маппинг: message_id тикета в админ-чате -> user_id (для reply)
+ticket_message_to_user = {}
 
 # Маппинг планов
 PLAN_NAMES = {
@@ -50,6 +53,23 @@ SQUAD_NAMES = {
     "9e60626e-32a8-4d91-a2f8-2aa3fecf7b23": "BS",
     "b6a4e86b-b769-4c86-a2d9-f31bbe645029": "PRO",
 }
+
+# Фразы-триггеры для эскалации (AI использует их в ответе)
+ESCALATION_TRIGGERS = [
+    "передаю ваш вопрос оператору",
+    "передаю вопрос оператору",
+    "связываю вас с оператором",
+    "перевожу на оператора",
+]
+
+# Фразы пользователя для запроса оператора
+USER_ESCALATION_PHRASES = [
+    "позови человека", "позовите человека", "позвать человека",
+    "хочу оператора", "хочу человека", "позовите оператора",
+    "позови оператора", "нужен человек", "нужен оператор",
+    "живой человек", "живой оператор", "свяжите с оператором",
+    "свяжите с человеком", "соединить с оператором",
+]
 
 
 def format_subscription_end(sub_end_str):
@@ -89,41 +109,141 @@ def get_ai_response(telegram_id: int, message: str):
         return None
 
 
-def trigger_escalation(chat_id: int, telegram_id: int):
-    """Call vpn-api escalation endpoint to create admin ticket."""
+def transcribe_voice(file_path: str) -> str:
+    """Транскрибирует голосовое сообщение через ProxyAPI Whisper."""
+    if not PROXYAPI_KEY:
+        return None
+    try:
+        with open(file_path, 'rb') as f:
+            resp = requests.post(
+                "https://openai.api.proxyapi.ru/v1/audio/transcriptions",
+                headers={"Authorization": f"Bearer {PROXYAPI_KEY}"},
+                files={"file": ("voice.ogg", f, "audio/ogg")},
+                data={"model": "whisper-1"},
+                timeout=30
+            )
+        if resp.status_code == 200:
+            return resp.json().get("text", "")
+        else:
+            logger.error(f"Whisper API error: {resp.status_code} {resp.text[:200]}")
+            return None
+    except Exception as e:
+        logger.error(f"Whisper transcription error: {e}")
+        return None
+
+
+def check_user_wants_escalation(text: str) -> bool:
+    """Проверяет, просит ли пользователь связать с оператором."""
+    lower = text.lower()
+    return any(phrase in lower for phrase in USER_ESCALATION_PHRASES)
+
+
+def check_ai_escalation(ai_text: str) -> bool:
+    """Проверяет, решил ли AI передать вопрос оператору."""
+    lower = ai_text.lower()
+    return any(trigger in lower for trigger in ESCALATION_TRIGGERS)
+
+
+def create_admin_ticket(user_id: int, username: str, reason: str = ""):
+    """Создаёт тикет для админа с информацией о пользователе и историей чата."""
+    active_tickets.add(user_id)
+
+    # Получаем информацию о пользователе
+    user_info_text = ""
+    try:
+        resp = requests.get(f"{API_URL}/{user_id}/info")
+        if resp.status_code == 200:
+            user = resp.json()
+            plan = PLAN_NAMES.get(user.get("plan", ""), user.get("plan", "—"))
+            sub_end = format_subscription_end(user.get("subscription_end", "—"))
+            is_active = "Активна" if user.get("is_active") == 1 else "Неактивна"
+            is_pro = "Да" if user.get("is_pro") else "Нет"
+            user_info_text = (
+                f"\n<b>Тариф:</b> {plan}"
+                f"\n<b>Статус:</b> {is_active}"
+                f"\n<b>PRO:</b> {is_pro}"
+                f"\n<b>Окончание:</b> {sub_end}"
+            )
+    except Exception as e:
+        logger.error(f"Failed to get user info for ticket: {e}")
+
+    # Получаем последние сообщения из чата (через vpn-api)
+    chat_history = ""
     try:
         resp = requests.post(
             f"{SUPPORT_API_URL}/internal/support/escalate",
-            json={"telegram_id": telegram_id},
+            json={"telegram_id": user_id},
             timeout=15
         )
-        if resp.status_code == 200:
-            bot.send_message(chat_id, "Ваш вопрос передан оператору. Он свяжется с вами в ближайшее время.")
-            logger.info(f"Escalation created for user {telegram_id}")
-        else:
-            logger.error(f"Escalation API error: {resp.status_code}")
-            bot.send_message(chat_id, "Произошла ошибка. Попробуйте позже или напишите @kirillqa17")
-    except Exception as e:
-        logger.error(f"Escalation exception for user {telegram_id}: {e}")
-        bot.send_message(chat_id, "Произошла ошибка. Попробуйте позже или напишите @kirillqa17")
+        # escalate endpoint уже отсылает в Telegram, но нам нужна история для отображения
+    except Exception:
+        pass
 
+    ticket_text = (
+        f"🎫 <b>НОВЫЙ ТИКЕТ</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"<b>Пользователь:</b> @{username}\n"
+        f"<b>ID:</b> <code>{user_id}</code>"
+        f"{user_info_text}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+    )
 
-def send_ai_response(chat_id: int, user_id: int, text: str):
-    """Send AI response with 'Связаться с человеком' inline button."""
+    if reason:
+        ticket_text += f"<b>Причина:</b> {reason}\n━━━━━━━━━━━━━━━━━━━━\n"
+
+    ticket_text += (
+        f"\n<b>Чтобы ответить:</b> ответьте на это сообщение (reply)\n"
+        f"<b>Закрыть тикет:</b> нажмите кнопку ниже"
+    )
+
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton(
-        text="Связаться с человеком",
-        callback_data=f"escalate_{user_id}"
+        text="✅ Закрыть тикет",
+        callback_data=f"close_ticket_{user_id}"
     ))
-    try:
-        bot.send_message(chat_id, text, reply_markup=markup)
-    except Exception as e:
-        logger.error(f"Error sending AI response to {chat_id}: {e}")
-        # Fallback: try without markup
+
+    for admin_id in ADMIN_IDS:
         try:
-            bot.send_message(chat_id, text)
-        except Exception as e2:
-            logger.error(f"Fallback send also failed for {chat_id}: {e2}")
+            sent = bot.send_message(
+                admin_id, ticket_text,
+                reply_markup=markup,
+                parse_mode="HTML"
+            )
+            # Сохраняем маппинг message_id -> user_id для reply
+            ticket_message_to_user[sent.message_id] = user_id
+            logger.info(f"Ticket sent to admin {admin_id} for user {user_id}")
+        except Exception as e:
+            logger.error(f"Error sending ticket to admin {admin_id}: {e}")
+
+
+def handle_escalation(chat_id: int, user_id: int, reason: str = ""):
+    """Обработка эскалации — создаёт тикет и уведомляет пользователя."""
+    username = user_data_cache.get(user_id, f"id{user_id}")
+    create_admin_ticket(user_id, username, reason)
+    bot.send_message(chat_id, "Ваш вопрос передан оператору. Он ответит в ближайшее время.")
+    logger.info(f"Escalation triggered for user {user_id}")
+
+
+def process_ai_response(chat_id: int, user_id: int, user_text: str):
+    """Отправляет текст в AI, обрабатывает ответ и эскалацию."""
+    bot.send_chat_action(chat_id, 'typing')
+
+    ai_text = get_ai_response(user_id, user_text)
+    if ai_text:
+        # Отправляем ответ AI (без кнопки)
+        try:
+            bot.send_message(chat_id, ai_text)
+        except Exception as e:
+            logger.error(f"Error sending AI response to {chat_id}: {e}")
+
+        # Проверяем, решил ли AI эскалировать
+        if check_ai_escalation(ai_text):
+            handle_escalation(chat_id, user_id, reason="AI предложил связаться с оператором")
+    else:
+        # AI недоступен — автоматическая эскалация
+        logger.warning(f"AI unavailable for user {user_id}, escalating")
+        bot.send_message(chat_id, "ИИ-ассистент временно недоступен.")
+        handle_escalation(chat_id, user_id, reason="AI недоступен")
 
 
 # ===== КОМАНДЫ =====
@@ -137,7 +257,9 @@ def send_welcome(message):
     else:
         logger.info(f"User {message.from_user.id} started the bot")
         bot.reply_to(message,
-                     "Здравствуйте! Это бот техподдержки SvoiVPN. Напишите Ваш вопрос, ИИ-ассистент ответит мгновенно. Если нужен живой оператор -- нажмите кнопку.")
+                     "Здравствуйте! Это бот техподдержки SvoiVPN.\n\n"
+                     "Напишите Ваш вопрос — ИИ-ассистент ответит мгновенно.\n"
+                     "Если нужен живой оператор — просто напишите \"позовите оператора\".")
 
 
 @bot.message_handler(commands=['help'], func=lambda message: message.from_user.id in ADMIN_IDS)
@@ -170,9 +292,9 @@ def handle_help(message):
    Продлит подписку на N дней по текущему тарифу каждого юзера
 
 <b>🎫 Тикеты:</b>
-6. <b>/reply</b> — Показать активные тикеты
-7. Ответьте на сообщение тикета, чтобы отправить ответ пользователю
-8. Используйте кнопку «Закрыть тикет» для завершения
+7. <b>/reply</b> — Показать активные тикеты
+8. Ответьте (reply) на сообщение тикета, чтобы отправить ответ пользователю
+9. Используйте кнопку «Закрыть тикет» для завершения
 
 <b>/help</b> — Эта справка
 """
@@ -467,7 +589,6 @@ def handle_compensate(message):
             tg_id = user.get("telegram_id")
             plan = user.get("plan", "")
 
-            # Пропускаем trial и free — нечего компенсировать
             if plan in ("trial", "free", ""):
                 skipped += 1
                 continue
@@ -522,8 +643,10 @@ def show_active_tickets(message):
             callback_data=f"view_ticket_{user_id}",
         ))
 
-    bot.send_message(message.chat.id, "Активные тикеты:", reply_markup=markup)
+    bot.send_message(message.chat.id, "🎫 Активные тикеты:", reply_markup=markup)
 
+
+# ===== ОБРАБОТКА СООБЩЕНИЙ ПОЛЬЗОВАТЕЛЕЙ =====
 
 @bot.message_handler(func=lambda message: message.from_user.id not in ADMIN_IDS,
                      content_types=['text'])
@@ -534,22 +657,70 @@ def handle_user_text_message(message):
 
     logger.info(f"User @{username} ({user_id}) sent text: {message.text[:50]}...")
 
-    # Show typing indicator while AI processes
-    bot.send_chat_action(message.chat.id, 'typing')
+    # Проверяем, просит ли пользователь оператора напрямую
+    if check_user_wants_escalation(message.text):
+        handle_escalation(message.chat.id, user_id, reason="Пользователь попросил оператора")
+        return
 
-    ai_text = get_ai_response(user_id, message.text)
-    if ai_text:
-        send_ai_response(message.chat.id, user_id, ai_text)
-    else:
-        # AI unavailable -- fallback to escalation
-        logger.warning(f"AI unavailable for user {user_id}, escalating")
-        bot.send_message(message.chat.id,
-                         "ИИ-ассистент временно недоступен. Ваш вопрос передан оператору.")
-        trigger_escalation(message.chat.id, user_id)
+    # Отправляем в AI
+    process_ai_response(message.chat.id, user_id, message.text)
 
 
 @bot.message_handler(func=lambda message: message.from_user.id not in ADMIN_IDS,
-                     content_types=['photo', 'document', 'audio', 'video', 'voice', 'sticker'])
+                     content_types=['voice'])
+def handle_user_voice_message(message):
+    """Обработка голосовых сообщений: транскрибируем и отправляем в AI."""
+    user_id = message.from_user.id
+    username = message.from_user.username or f"id{user_id}"
+    user_data_cache[user_id] = username
+
+    logger.info(f"User @{username} ({user_id}) sent voice message")
+    bot.send_chat_action(message.chat.id, 'typing')
+
+    try:
+        # Скачиваем голосовое сообщение
+        file_info = bot.get_file(message.voice.file_id)
+        downloaded = bot.download_file(file_info.file_path)
+
+        with tempfile.NamedTemporaryFile(suffix='.ogg', delete=False) as tmp:
+            tmp.write(downloaded)
+            tmp_path = tmp.name
+
+        # Транскрибируем
+        transcription = transcribe_voice(tmp_path)
+
+        # Удаляем временный файл
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+
+        if transcription:
+            logger.info(f"Voice transcribed for {user_id}: {transcription[:50]}...")
+
+            # Проверяем эскалацию
+            if check_user_wants_escalation(transcription):
+                handle_escalation(message.chat.id, user_id, reason="Пользователь попросил оператора (голосовое)")
+                return
+
+            # Отправляем транскрипцию в AI
+            process_ai_response(message.chat.id, user_id, transcription)
+        else:
+            bot.send_message(
+                message.chat.id,
+                "Не удалось распознать голосовое сообщение. Пожалуйста, напишите текстом."
+            )
+
+    except Exception as e:
+        logger.error(f"Voice processing error for {user_id}: {e}")
+        bot.send_message(
+            message.chat.id,
+            "Не удалось обработать голосовое сообщение. Пожалуйста, напишите текстом."
+        )
+
+
+@bot.message_handler(func=lambda message: message.from_user.id not in ADMIN_IDS,
+                     content_types=['photo', 'document', 'audio', 'video', 'sticker'])
 def handle_user_media_message(message):
     user_id = message.from_user.id
     username = message.from_user.username or f"id{user_id}"
@@ -557,49 +728,45 @@ def handle_user_media_message(message):
 
     logger.info(f"User @{username} ({user_id}) sent {message.content_type}")
 
-    # Store in tickets for admin view
+    # Сохраняем в тикеты
     msg_info = {
         "username": username,
         "message_id": message.message_id,
         "chat_id": message.chat.id,
         "content_type": message.content_type,
-        "content": message
     }
     user_tickets[user_id].append(msg_info)
 
     if user_id not in active_tickets:
         active_tickets.add(user_id)
 
-    # Forward media to admins (AI can't process media)
+    # Пересылаем медиа админам с тикетом
     for admin_id in ADMIN_IDS:
         try:
             bot.forward_message(admin_id, message.chat.id, message.message_id)
             markup = types.InlineKeyboardMarkup()
             markup.add(types.InlineKeyboardButton(
-                text="Ответить",
-                callback_data=f"view_ticket_{user_id}"
+                text="✅ Закрыть тикет",
+                callback_data=f"close_ticket_{user_id}"
             ))
-            bot.send_message(
+            sent = bot.send_message(
                 admin_id,
-                f"Медиа от @{username} (ID: <code>{user_id}</code>)",
+                f"📎 Медиа от @{username} (ID: <code>{user_id}</code>)\n"
+                f"Ответьте на это сообщение, чтобы написать пользователю.",
                 reply_markup=markup,
                 parse_mode="HTML"
             )
+            ticket_message_to_user[sent.message_id] = user_id
         except Exception as e:
             logger.error(f"Error forwarding media to admin {admin_id}: {e}")
 
-    # Prompt user to describe in text
-    escalate_markup = types.InlineKeyboardMarkup()
-    escalate_markup.add(types.InlineKeyboardButton(
-        text="Связаться с человеком",
-        callback_data=f"escalate_{user_id}"
-    ))
     bot.send_message(
         message.chat.id,
-        "Ваш файл передан оператору. Если хотите, опишите проблему текстом -- ИИ-ассистент сможет помочь быстрее.",
-        reply_markup=escalate_markup
+        "Ваш файл передан оператору. Если хотите, опишите проблему текстом — ИИ-ассистент сможет помочь быстрее."
     )
 
+
+# ===== CALLBACKS =====
 
 @bot.callback_query_handler(func=lambda call: True)
 def callback_handler(call):
@@ -609,16 +776,12 @@ def callback_handler(call):
     elif call.data.startswith('close_ticket_'):
         user_id = int(call.data.split('_')[-1])
         close_ticket(call.message.chat.id, user_id)
-    elif call.data.startswith('escalate_'):
-        user_id = int(call.data.split('_')[1])
-        logger.info(f"User {user_id} requested human support via button")
-        bot.answer_callback_query(call.id, text="Передаем оператору...")
-        trigger_escalation(call.message.chat.id, user_id)
+        bot.answer_callback_query(call.id, text="Тикет закрыт")
 
 
 def show_user_messages(admin_chat_id, user_id):
-    if user_id not in user_tickets:
-        bot.send_message(admin_chat_id, "Тикет не найден.")
+    if user_id not in user_tickets or not user_tickets[user_id]:
+        bot.send_message(admin_chat_id, "Нет сохранённых сообщений в тикете.")
         return
 
     username = user_data_cache.get(user_id, f"id{user_id}")
@@ -631,42 +794,59 @@ def show_user_messages(admin_chat_id, user_id):
 
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton(
-        text="Закрыть тикет",
+        text="✅ Закрыть тикет",
         callback_data=f"close_ticket_{user_id}"
     ))
 
-    bot.send_message(
+    sent = bot.send_message(
         admin_chat_id,
-        f"Вы просматриваете тикет @{username} (ID: <code>{user_id}</code>). Ответьте на это сообщение, чтобы отправить ответ пользователю.",
+        f"🎫 Тикет @{username} (ID: <code>{user_id}</code>)\n"
+        f"Ответьте на это сообщение, чтобы написать пользователю.",
         reply_markup=markup,
         parse_mode='HTML'
     )
+    ticket_message_to_user[sent.message_id] = user_id
 
 
 def close_ticket(admin_chat_id, user_id):
     if user_id in active_tickets:
-        active_tickets.remove(user_id)
+        active_tickets.discard(user_id)
         if user_id in user_tickets:
             del user_tickets[user_id]
         logger.info(f"Ticket closed for user {user_id}")
-        bot.send_message(admin_chat_id, "Тикет закрыт.")
+        bot.send_message(admin_chat_id, f"✅ Тикет для {user_id} закрыт.")
     else:
         bot.send_message(admin_chat_id, "Тикет уже закрыт или не существует.")
 
+
+# ===== ОТВЕТ АДМИНА =====
 
 @bot.message_handler(func=lambda message: message.reply_to_message is not None and
                                           message.from_user.id in ADMIN_IDS,
                      content_types=['text', 'photo', 'document', 'audio', 'video', 'voice', 'sticker'])
 def handle_admin_reply(message):
-    reply_text = message.reply_to_message.text
-    if not reply_text or "Вы просматриваете тикет @" not in reply_text:
-        return
+    """Админ отвечает на тикет — reply на сообщение тикета."""
+    replied_msg_id = message.reply_to_message.message_id
 
-    try:
-        user_id = int(reply_text.split("(ID: ")[1].split(")")[0])
-    except (IndexError, ValueError):
-        bot.reply_to(message, "Не удалось определить ID пользователя.")
-        return
+    # Ищем user_id по message_id тикета
+    user_id = ticket_message_to_user.get(replied_msg_id)
+
+    # Фоллбэк: пробуем найти по тексту сообщения (старый формат)
+    if not user_id:
+        reply_text = message.reply_to_message.text or ""
+        if "ID:" in reply_text:
+            try:
+                user_id = int(reply_text.split("ID: ")[1].split(")")[0].strip())
+            except (IndexError, ValueError):
+                pass
+        if "ID:</code>" in reply_text:
+            try:
+                user_id = int(reply_text.split("ID:</code>")[0].split("<code>")[-1].strip())
+            except (IndexError, ValueError):
+                pass
+
+    if not user_id:
+        return  # Не тикетное сообщение — игнорируем
 
     username = user_data_cache.get(user_id, f"id{user_id}")
 
@@ -683,16 +863,16 @@ def handle_admin_reply(message):
         elif message.content_type == 'video':
             bot.send_video(user_id, message.video.file_id, caption=f"✉️ Ответ поддержки:\n{message.caption or ''}")
         elif message.content_type == 'voice':
-            bot.send_voice(user_id, message.voice.file_id, caption=f"✉️ Ответ поддержки")
+            bot.send_voice(user_id, message.voice.file_id, caption="✉️ Ответ поддержки")
         elif message.content_type == 'sticker':
             bot.send_sticker(user_id, message.sticker.file_id)
             bot.send_message(user_id, "✉️ Ответ поддержки (стикер)")
 
         logger.info(f"Admin {message.from_user.id} replied to user {user_id}")
-        bot.reply_to(message, f"Ответ отправлен пользователю @{username}.")
+        bot.reply_to(message, f"✅ Ответ отправлен пользователю @{username}.")
     except Exception as e:
         logger.error(f"Error sending reply to user {user_id}: {e}")
-        bot.reply_to(message, f"Ошибка при отправке ответа: {e}")
+        bot.reply_to(message, f"❌ Ошибка при отправке ответа: {e}")
 
 
 # Запускаем бота
