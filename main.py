@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.getenv('BOT_TOKEN_SUPPORT')
 ADMIN_IDS = list(map(int, os.getenv('ADMIN_IDS').split(',')))
 API_URL = os.getenv('API_URL_SUPPORT')
+SUPPORT_API_URL = os.getenv('SUPPORT_API_URL', 'http://vpn-api:8080')
 
 # Инициализируем бота
 bot = telebot.TeleBot(BOT_TOKEN)
@@ -66,6 +67,65 @@ def get_squad_name(uuid):
     return SQUAD_NAMES.get(uuid, uuid)
 
 
+def get_ai_response(telegram_id: int, message: str):
+    """Call vpn-api AI support endpoint. Returns response text or None on failure."""
+    try:
+        resp = requests.post(
+            f"{SUPPORT_API_URL}/internal/support/chat",
+            json={"telegram_id": telegram_id, "message": message},
+            timeout=30
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            return data.get("response")
+        else:
+            logger.error(f"AI API error: {resp.status_code} {resp.text[:200]}")
+            return None
+    except requests.Timeout:
+        logger.error(f"AI API timeout for user {telegram_id}")
+        return None
+    except Exception as e:
+        logger.error(f"AI API exception for user {telegram_id}: {e}")
+        return None
+
+
+def trigger_escalation(chat_id: int, telegram_id: int):
+    """Call vpn-api escalation endpoint to create admin ticket."""
+    try:
+        resp = requests.post(
+            f"{SUPPORT_API_URL}/internal/support/escalate",
+            json={"telegram_id": telegram_id},
+            timeout=15
+        )
+        if resp.status_code == 200:
+            bot.send_message(chat_id, "Ваш вопрос передан оператору. Он свяжется с вами в ближайшее время.")
+            logger.info(f"Escalation created for user {telegram_id}")
+        else:
+            logger.error(f"Escalation API error: {resp.status_code}")
+            bot.send_message(chat_id, "Произошла ошибка. Попробуйте позже или напишите @kirillqa17")
+    except Exception as e:
+        logger.error(f"Escalation exception for user {telegram_id}: {e}")
+        bot.send_message(chat_id, "Произошла ошибка. Попробуйте позже или напишите @kirillqa17")
+
+
+def send_ai_response(chat_id: int, user_id: int, text: str):
+    """Send AI response with 'Связаться с человеком' inline button."""
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton(
+        text="Связаться с человеком",
+        callback_data=f"escalate_{user_id}"
+    ))
+    try:
+        bot.send_message(chat_id, text, reply_markup=markup)
+    except Exception as e:
+        logger.error(f"Error sending AI response to {chat_id}: {e}")
+        # Fallback: try without markup
+        try:
+            bot.send_message(chat_id, text)
+        except Exception as e2:
+            logger.error(f"Fallback send also failed for {chat_id}: {e2}")
+
+
 # ===== КОМАНДЫ =====
 
 @bot.message_handler(commands=['start'])
@@ -77,7 +137,7 @@ def send_welcome(message):
     else:
         logger.info(f"User {message.from_user.id} started the bot")
         bot.reply_to(message,
-                     "Привет! Это бот техподдержки SvoiVPN. Напишите ваш вопрос, и мы обязательно вам ответим в скором времени!")
+                     "Здравствуйте! Это бот техподдержки SvoiVPN. Напишите Ваш вопрос, ИИ-ассистент ответит мгновенно. Если нужен живой оператор -- нажмите кнопку.")
 
 
 @bot.message_handler(commands=['help'], func=lambda message: message.from_user.id in ADMIN_IDS)
