@@ -526,13 +526,38 @@ def show_active_tickets(message):
 
 
 @bot.message_handler(func=lambda message: message.from_user.id not in ADMIN_IDS,
-                     content_types=['text', 'photo', 'document', 'audio', 'video', 'voice', 'sticker'])
-def handle_user_message(message):
+                     content_types=['text'])
+def handle_user_text_message(message):
     user_id = message.from_user.id
     username = message.from_user.username or f"id{user_id}"
-
     user_data_cache[user_id] = username
 
+    logger.info(f"User @{username} ({user_id}) sent text: {message.text[:50]}...")
+
+    # Show typing indicator while AI processes
+    bot.send_chat_action(message.chat.id, 'typing')
+
+    ai_text = get_ai_response(user_id, message.text)
+    if ai_text:
+        send_ai_response(message.chat.id, user_id, ai_text)
+    else:
+        # AI unavailable -- fallback to escalation
+        logger.warning(f"AI unavailable for user {user_id}, escalating")
+        bot.send_message(message.chat.id,
+                         "ИИ-ассистент временно недоступен. Ваш вопрос передан оператору.")
+        trigger_escalation(message.chat.id, user_id)
+
+
+@bot.message_handler(func=lambda message: message.from_user.id not in ADMIN_IDS,
+                     content_types=['photo', 'document', 'audio', 'video', 'voice', 'sticker'])
+def handle_user_media_message(message):
+    user_id = message.from_user.id
+    username = message.from_user.username or f"id{user_id}"
+    user_data_cache[user_id] = username
+
+    logger.info(f"User @{username} ({user_id}) sent {message.content_type}")
+
+    # Store in tickets for admin view
     msg_info = {
         "username": username,
         "message_id": message.message_id,
@@ -542,43 +567,38 @@ def handle_user_message(message):
     }
     user_tickets[user_id].append(msg_info)
 
-    bot.reply_to(message, "✅ Ваше сообщение получено и будет обработано в ближайшее время.")
-
-    if user_id in active_tickets:
-        for admin_id in ADMIN_IDS:
-            try:
-                bot.forward_message(admin_id, msg_info['chat_id'], msg_info['message_id'])
-                markup = types.InlineKeyboardMarkup()
-                markup.add(types.InlineKeyboardButton(
-                    text="Ответить",
-                    callback_data=f"view_ticket_{user_id}"
-                ))
-                bot.send_message(
-                    admin_id,
-                    f"📩 Новое сообщение в тикете от @{username} (ID: <code>{user_id}</code>)",
-                    reply_markup=markup,
-                    parse_mode="HTML"
-                )
-            except Exception as e:
-                logger.error(f"Error forwarding message to admin {admin_id}: {e}")
-    else:
+    if user_id not in active_tickets:
         active_tickets.add(user_id)
-        logger.info(f"New ticket from @{username} (ID: {user_id})")
-        for admin_id in ADMIN_IDS:
-            try:
-                bot.send_message(
-                    admin_id,
-                    f"📩 Новый тикет от @{username} (ID: <code>{user_id}</code>)",
-                    reply_markup=types.InlineKeyboardMarkup().add(
-                        types.InlineKeyboardButton(
-                            text="Ответить",
-                            callback_data=f"view_ticket_{user_id}"
-                        )
-                    ),
-                    parse_mode="HTML"
-                )
-            except Exception as e:
-                logger.error(f"Error notifying admin {admin_id}: {e}")
+
+    # Forward media to admins (AI can't process media)
+    for admin_id in ADMIN_IDS:
+        try:
+            bot.forward_message(admin_id, message.chat.id, message.message_id)
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton(
+                text="Ответить",
+                callback_data=f"view_ticket_{user_id}"
+            ))
+            bot.send_message(
+                admin_id,
+                f"Медиа от @{username} (ID: <code>{user_id}</code>)",
+                reply_markup=markup,
+                parse_mode="HTML"
+            )
+        except Exception as e:
+            logger.error(f"Error forwarding media to admin {admin_id}: {e}")
+
+    # Prompt user to describe in text
+    escalate_markup = types.InlineKeyboardMarkup()
+    escalate_markup.add(types.InlineKeyboardButton(
+        text="Связаться с человеком",
+        callback_data=f"escalate_{user_id}"
+    ))
+    bot.send_message(
+        message.chat.id,
+        "Ваш файл передан оператору. Если хотите, опишите проблему текстом -- ИИ-ассистент сможет помочь быстрее.",
+        reply_markup=escalate_markup
+    )
 
 
 @bot.callback_query_handler(func=lambda call: True)
@@ -589,6 +609,11 @@ def callback_handler(call):
     elif call.data.startswith('close_ticket_'):
         user_id = int(call.data.split('_')[-1])
         close_ticket(call.message.chat.id, user_id)
+    elif call.data.startswith('escalate_'):
+        user_id = int(call.data.split('_')[1])
+        logger.info(f"User {user_id} requested human support via button")
+        bot.answer_callback_query(call.id, text="Передаем оператору...")
+        trigger_escalation(call.message.chat.id, user_id)
 
 
 def show_user_messages(admin_chat_id, user_id):
