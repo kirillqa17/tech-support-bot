@@ -29,11 +29,12 @@ PROXYAPI_KEY = os.getenv('PROXYAPI_KEY', '')
 bot = telebot.TeleBot(BOT_TOKEN)
 
 # Тикет-система
-user_tickets = defaultdict(list)  # user_id -> [msg_info, ...]
 active_tickets = set()  # set of user_ids with open tickets
 user_data_cache = {}  # user_id -> username
 # Маппинг: message_id тикета в админ-чате -> user_id (для reply)
 ticket_message_to_user = {}
+# Хранилище сообщений для пересылки: user_id -> [(chat_id, message_id), ...]
+user_conversation = defaultdict(list)
 
 # Маппинг планов
 PLAN_NAMES = {
@@ -145,7 +146,7 @@ def check_ai_escalation(ai_text: str) -> bool:
 
 
 def create_admin_ticket(user_id: int, username: str, reason: str = ""):
-    """Создаёт тикет для админа с информацией о пользователе и историей чата."""
+    """Создаёт тикет для админа с инфо о юзере и кнопкой 'Открыть'."""
     active_tickets.add(user_id)
 
     # Получаем информацию о пользователе
@@ -167,17 +168,7 @@ def create_admin_ticket(user_id: int, username: str, reason: str = ""):
     except Exception as e:
         logger.error(f"Failed to get user info for ticket: {e}")
 
-    # Получаем последние сообщения из чата (через vpn-api)
-    chat_history = ""
-    try:
-        resp = requests.post(
-            f"{SUPPORT_API_URL}/internal/support/escalate",
-            json={"telegram_id": user_id},
-            timeout=15
-        )
-        # escalate endpoint уже отсылает в Telegram, но нам нужна история для отображения
-    except Exception:
-        pass
+    msg_count = len(user_conversation.get(user_id, []))
 
     ticket_text = (
         f"🎫 <b>НОВЫЙ ТИКЕТ</b>\n"
@@ -185,22 +176,24 @@ def create_admin_ticket(user_id: int, username: str, reason: str = ""):
         f"<b>Пользователь:</b> @{username}\n"
         f"<b>ID:</b> <code>{user_id}</code>"
         f"{user_info_text}\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"<b>Сообщений в диалоге:</b> {msg_count}\n"
+        f"━━━━━━━━━━━━━━━━━━━━"
     )
 
     if reason:
-        ticket_text += f"<b>Причина:</b> {reason}\n━━━━━━━━━━━━━━━━━━━━\n"
+        ticket_text += f"\n<b>Причина:</b> {reason}"
 
-    ticket_text += (
-        f"\n<b>Чтобы ответить:</b> ответьте на это сообщение (reply)\n"
-        f"<b>Закрыть тикет:</b> нажмите кнопку ниже"
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton(
+            text="📖 Открыть переписку",
+            callback_data=f"open_ticket_{user_id}"
+        ),
+        types.InlineKeyboardButton(
+            text="✅ Закрыть тикет",
+            callback_data=f"close_ticket_{user_id}"
+        )
     )
-
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton(
-        text="✅ Закрыть тикет",
-        callback_data=f"close_ticket_{user_id}"
-    ))
 
     for admin_id in ADMIN_IDS:
         try:
@@ -209,11 +202,50 @@ def create_admin_ticket(user_id: int, username: str, reason: str = ""):
                 reply_markup=markup,
                 parse_mode="HTML"
             )
-            # Сохраняем маппинг message_id -> user_id для reply
             ticket_message_to_user[sent.message_id] = user_id
             logger.info(f"Ticket sent to admin {admin_id} for user {user_id}")
         except Exception as e:
             logger.error(f"Error sending ticket to admin {admin_id}: {e}")
+
+
+def open_ticket_conversation(admin_chat_id: int, user_id: int):
+    """Пересылает админу всю переписку с юзером и предлагает ответить."""
+    username = user_data_cache.get(user_id, f"id{user_id}")
+    conversation = user_conversation.get(user_id, [])
+
+    if not conversation:
+        bot.send_message(admin_chat_id, "Нет сохранённых сообщений.")
+        return
+
+    bot.send_message(
+        admin_chat_id,
+        f"📖 <b>Переписка с @{username} ({user_id}):</b>",
+        parse_mode="HTML"
+    )
+
+    # Пересылаем все сообщения из диалога
+    for chat_id, msg_id in conversation:
+        try:
+            bot.forward_message(admin_chat_id, chat_id, msg_id)
+        except Exception as e:
+            logger.error(f"Error forwarding msg {msg_id}: {e}")
+
+    # Финальное сообщение для reply
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton(
+        text="✅ Закрыть тикет",
+        callback_data=f"close_ticket_{user_id}"
+    ))
+
+    sent = bot.send_message(
+        admin_chat_id,
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"👆 Переписка с @{username} (ID: <code>{user_id}</code>)\n\n"
+        f"<b>Ответьте на это сообщение, чтобы написать пользователю.</b>",
+        reply_markup=markup,
+        parse_mode="HTML"
+    )
+    ticket_message_to_user[sent.message_id] = user_id
 
 
 def handle_escalation(chat_id: int, user_id: int, reason: str = ""):
@@ -232,7 +264,9 @@ def process_ai_response(chat_id: int, user_id: int, user_text: str):
     if ai_text:
         # Отправляем ответ AI (без кнопки)
         try:
-            bot.send_message(chat_id, ai_text)
+            sent = bot.send_message(chat_id, ai_text)
+            # Сохраняем ответ AI для пересылки в тикете
+            user_conversation[user_id].append((chat_id, sent.message_id))
         except Exception as e:
             logger.error(f"Error sending AI response to {chat_id}: {e}")
 
@@ -657,6 +691,9 @@ def handle_user_text_message(message):
 
     logger.info(f"User @{username} ({user_id}) sent text: {message.text[:50]}...")
 
+    # Сохраняем сообщение юзера для пересылки в тикете
+    user_conversation[user_id].append((message.chat.id, message.message_id))
+
     # Проверяем, просит ли пользователь оператора напрямую
     if check_user_wants_escalation(message.text):
         handle_escalation(message.chat.id, user_id, reason="Пользователь попросил оператора")
@@ -675,6 +712,10 @@ def handle_user_voice_message(message):
     user_data_cache[user_id] = username
 
     logger.info(f"User @{username} ({user_id}) sent voice message")
+
+    # Сохраняем голосовое для пересылки в тикете
+    user_conversation[user_id].append((message.chat.id, message.message_id))
+
     bot.send_chat_action(message.chat.id, 'typing')
 
     try:
@@ -728,41 +769,17 @@ def handle_user_media_message(message):
 
     logger.info(f"User @{username} ({user_id}) sent {message.content_type}")
 
-    # Сохраняем в тикеты
-    msg_info = {
-        "username": username,
-        "message_id": message.message_id,
-        "chat_id": message.chat.id,
-        "content_type": message.content_type,
-    }
-    user_tickets[user_id].append(msg_info)
+    # Сохраняем сообщение для пересылки в тикете
+    user_conversation[user_id].append((message.chat.id, message.message_id))
 
-    if user_id not in active_tickets:
-        active_tickets.add(user_id)
-
-    # Пересылаем медиа админам с тикетом
-    for admin_id in ADMIN_IDS:
-        try:
-            bot.forward_message(admin_id, message.chat.id, message.message_id)
-            markup = types.InlineKeyboardMarkup()
-            markup.add(types.InlineKeyboardButton(
-                text="✅ Закрыть тикет",
-                callback_data=f"close_ticket_{user_id}"
-            ))
-            sent = bot.send_message(
-                admin_id,
-                f"📎 Медиа от @{username} (ID: <code>{user_id}</code>)\n"
-                f"Ответьте на это сообщение, чтобы написать пользователю.",
-                reply_markup=markup,
-                parse_mode="HTML"
-            )
-            ticket_message_to_user[sent.message_id] = user_id
-        except Exception as e:
-            logger.error(f"Error forwarding media to admin {admin_id}: {e}")
+    # Фото с caption — отправляем caption как текст в AI
+    if message.content_type == 'photo' and message.caption:
+        process_ai_response(message.chat.id, user_id, f"[Пользователь отправил фото] {message.caption}")
+        return
 
     bot.send_message(
         message.chat.id,
-        "Ваш файл передан оператору. Если хотите, опишите проблему текстом — ИИ-ассистент сможет помочь быстрее."
+        "Опишите проблему текстом — ИИ-ассистент сможет помочь быстрее."
     )
 
 
@@ -770,49 +787,27 @@ def handle_user_media_message(message):
 
 @bot.callback_query_handler(func=lambda call: True)
 def callback_handler(call):
-    if call.data.startswith('view_ticket_'):
+    if call.data.startswith('open_ticket_'):
         user_id = int(call.data.split('_')[-1])
-        show_user_messages(call.message.chat.id, user_id)
+        bot.answer_callback_query(call.id, text="Загружаю переписку...")
+        open_ticket_conversation(call.message.chat.id, user_id)
+    elif call.data.startswith('view_ticket_'):
+        user_id = int(call.data.split('_')[-1])
+        bot.answer_callback_query(call.id, text="Загружаю...")
+        open_ticket_conversation(call.message.chat.id, user_id)
     elif call.data.startswith('close_ticket_'):
         user_id = int(call.data.split('_')[-1])
         close_ticket(call.message.chat.id, user_id)
         bot.answer_callback_query(call.id, text="Тикет закрыт")
 
 
-def show_user_messages(admin_chat_id, user_id):
-    if user_id not in user_tickets or not user_tickets[user_id]:
-        bot.send_message(admin_chat_id, "Нет сохранённых сообщений в тикете.")
-        return
-
-    username = user_data_cache.get(user_id, f"id{user_id}")
-
-    for msg_info in user_tickets[user_id]:
-        try:
-            bot.forward_message(admin_chat_id, msg_info['chat_id'], msg_info['message_id'])
-        except Exception as e:
-            logger.error(f"Error forwarding message: {e}")
-
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton(
-        text="✅ Закрыть тикет",
-        callback_data=f"close_ticket_{user_id}"
-    ))
-
-    sent = bot.send_message(
-        admin_chat_id,
-        f"🎫 Тикет @{username} (ID: <code>{user_id}</code>)\n"
-        f"Ответьте на это сообщение, чтобы написать пользователю.",
-        reply_markup=markup,
-        parse_mode='HTML'
-    )
-    ticket_message_to_user[sent.message_id] = user_id
 
 
 def close_ticket(admin_chat_id, user_id):
     if user_id in active_tickets:
         active_tickets.discard(user_id)
-        if user_id in user_tickets:
-            del user_tickets[user_id]
+        if user_id in user_conversation:
+            del user_conversation[user_id]
         logger.info(f"Ticket closed for user {user_id}")
         bot.send_message(admin_chat_id, f"✅ Тикет для {user_id} закрыт.")
     else:
