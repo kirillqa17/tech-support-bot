@@ -772,14 +772,14 @@ def handle_user_media_message(message):
     # Сохраняем сообщение для пересылки в тикете
     user_conversation[user_id].append((message.chat.id, message.message_id))
 
-    # Фото с caption — отправляем caption как текст в AI
-    if message.content_type == 'photo' and message.caption:
-        process_ai_response(message.chat.id, user_id, f"[Пользователь отправил фото] {message.caption}")
+    # Фото с подписью — отправляем только подпись в AI
+    if message.caption:
+        process_ai_response(message.chat.id, user_id, message.caption)
         return
 
     bot.send_message(
         message.chat.id,
-        "Опишите проблему текстом — ИИ-ассистент сможет помочь быстрее."
+        "Опишите проблему текстом — ИИ-ассистент сможет помочь быстрее 😊"
     )
 
 
