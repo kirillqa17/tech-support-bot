@@ -35,6 +35,8 @@ user_data_cache = {}  # user_id -> username
 ticket_message_to_user = {}
 # Хранилище сообщений для пересылки: user_id -> [(chat_id, message_id), ...]
 user_conversation = defaultdict(list)
+# Время последнего сообщения: user_id -> datetime
+user_last_activity = {}
 
 # Маппинг планов
 PLAN_NAMES = {
@@ -707,25 +709,66 @@ def handle_compensate(message):
 
 # ===== МОНИТОРИНГ ЧАТОВ =====
 
+def format_time_ago(dt):
+    """Форматирует время в 'X мин назад' / 'X ч назад' / 'X дн назад'."""
+    delta = datetime.now() - dt
+    minutes = int(delta.total_seconds() / 60)
+    if minutes < 1:
+        return "только что"
+    if minutes < 60:
+        return f"{minutes} мин"
+    hours = minutes // 60
+    if hours < 24:
+        return f"{hours} ч"
+    days = hours // 24
+    return f"{days} дн"
+
+
 @bot.message_handler(commands=['chats'], func=lambda message: message.from_user.id in ADMIN_IDS)
 def show_active_chats(message):
-    """Показывает всех юзеров с активными диалогами — для мониторинга без тикетов."""
+    """Показывает всех юзеров с диалогами — для мониторинга."""
     logger.info(f"Admin {message.from_user.id} requested /chats")
     if not user_conversation:
         bot.reply_to(message, "Нет активных диалогов.")
         return
 
+    # Сортируем по времени последней активности (свежие сверху)
+    sorted_users = sorted(
+        user_conversation.keys(),
+        key=lambda uid: user_last_activity.get(uid, datetime.min),
+        reverse=True
+    )
+
     markup = types.InlineKeyboardMarkup()
-    for user_id in sorted(user_conversation.keys(), key=lambda uid: len(user_conversation[uid]), reverse=True):
+    for user_id in sorted_users[:20]:  # Макс 20 чтобы не перегрузить
         username = user_data_cache.get(user_id, f"id{user_id}")
         msg_count = len(user_conversation[user_id])
-        is_ticket = "🎫 " if user_id in active_tickets else ""
+        last_time = user_last_activity.get(user_id)
+        time_str = format_time_ago(last_time) if last_time else "?"
+
+        # Статус
+        if user_id in active_tickets:
+            status = "🎫"
+        elif last_time and (datetime.now() - last_time).total_seconds() < 600:
+            status = "🟢"  # активен (< 10 мин)
+        elif last_time and (datetime.now() - last_time).total_seconds() < 3600:
+            status = "🟡"  # недавно (< 1 ч)
+        else:
+            status = "⚪"  # давно
+
         markup.add(types.InlineKeyboardButton(
-            text=f"{is_ticket}@{username} ({msg_count} сообщ.)",
+            text=f"{status} @{username} · {msg_count} сообщ. · {time_str}",
             callback_data=f"peek_{user_id}",
         ))
 
-    bot.send_message(message.chat.id, "💬 Активные диалоги с ИИ:", reply_markup=markup)
+    legend = (
+        "💬 <b>Диалоги с ИИ:</b>\n\n"
+        "🟢 активен (< 10 мин)\n"
+        "🟡 недавно (< 1 ч)\n"
+        "⚪ давно\n"
+        "🎫 есть тикет"
+    )
+    bot.send_message(message.chat.id, legend, reply_markup=markup, parse_mode="HTML")
 
 
 # ===== ТИКЕТЫ =====
@@ -761,6 +804,7 @@ def handle_user_text_message(message):
 
     # Сохраняем сообщение юзера для пересылки в тикете
     user_conversation[user_id].append((message.chat.id, message.message_id))
+    user_last_activity[user_id] = datetime.now()
 
     # Проверяем, просит ли пользователь оператора напрямую
     if check_user_wants_escalation(message.text):
