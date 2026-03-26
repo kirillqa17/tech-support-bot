@@ -7,6 +7,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 import requests
 import tempfile
+import json
 
 # Загружаем переменные из .env файла
 load_dotenv()
@@ -35,6 +36,8 @@ user_data_cache = {}  # user_id -> username
 ticket_message_to_user = {}
 # Хранилище сообщений для пересылки: user_id -> [(chat_id, message_id), ...]
 user_conversation = defaultdict(list)
+# Текстовый лог переписки: user_id -> [{"role": "user"/"ai"/"admin", "text": "...", "time": "..."}, ...]
+chat_log = defaultdict(list)
 # Время последнего сообщения: user_id -> datetime
 user_last_activity = {}
 
@@ -73,6 +76,55 @@ USER_ESCALATION_PHRASES = [
     "живой человек", "живой оператор", "свяжите с оператором",
     "свяжите с человеком", "соединить с оператором",
 ]
+
+STATE_FILE = '/data/bot_state.json'
+
+
+def save_state():
+    """Save bot state to disk for persistence across restarts."""
+    try:
+        state = {
+            'active_tickets': list(active_tickets),
+            'user_data_cache': user_data_cache,
+            'ticket_message_to_user': {str(k): v for k, v in ticket_message_to_user.items()},
+            'user_last_activity': {str(k): v.isoformat() for k, v in user_last_activity.items()},
+            'chat_log': {str(k): v[-50:] for k, v in chat_log.items()},  # Keep last 50 msgs per user
+        }
+        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+        with open(STATE_FILE, 'w') as f:
+            json.dump(state, f)
+    except Exception as e:
+        logger.error(f"Failed to save state: {e}")
+
+
+def load_state():
+    """Load bot state from disk on startup."""
+    global active_tickets, user_data_cache, ticket_message_to_user, user_last_activity, chat_log
+    try:
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE, 'r') as f:
+                state = json.load(f)
+            active_tickets = set(state.get('active_tickets', []))
+            user_data_cache = state.get('user_data_cache', {})
+            # Convert string keys back to int
+            user_data_cache = {int(k): v for k, v in user_data_cache.items()}
+            ticket_message_to_user = {int(k): v for k, v in state.get('ticket_message_to_user', {}).items()}
+            user_last_activity = {}
+            for k, v in state.get('user_last_activity', {}).items():
+                try:
+                    user_last_activity[int(k)] = datetime.fromisoformat(v)
+                except Exception:
+                    pass
+            # Restore chat_log
+            for k, v in state.get('chat_log', {}).items():
+                chat_log[int(k)] = v
+            logger.info(f"State loaded: {len(active_tickets)} active tickets, {len(user_data_cache)} cached users, {len(chat_log)} chat logs")
+    except Exception as e:
+        logger.error(f"Failed to load state: {e}")
+
+
+# Load persisted state
+load_state()
 
 
 def format_subscription_end(sub_end_str):
@@ -150,6 +202,7 @@ def check_ai_escalation(ai_text: str) -> bool:
 def create_admin_ticket(user_id: int, username: str, reason: str = ""):
     """Создаёт тикет для админа с инфо о юзере и кнопкой 'Открыть'."""
     active_tickets.add(user_id)
+    save_state()
 
     # Получаем информацию о пользователе
     user_info_text = ""
@@ -211,44 +264,57 @@ def create_admin_ticket(user_id: int, username: str, reason: str = ""):
 
 
 def peek_conversation(admin_chat_id: int, user_id: int):
-    """Просмотр переписки юзера с ИИ (без создания тикета, read-only)."""
+    """Просмотр переписки юзера — показывает текстовый лог с ролями."""
     username = user_data_cache.get(user_id, f"id{user_id}")
-    conversation = user_conversation.get(user_id, [])
+    log = chat_log.get(user_id, [])
 
-    if not conversation:
+    if not log:
         bot.send_message(admin_chat_id, "Нет сохранённых сообщений.")
         return
 
-    bot.send_message(
-        admin_chat_id,
-        f"👁 <b>Просмотр диалога @{username} ({user_id}):</b>",
-        parse_mode="HTML"
-    )
+    # Build readable chat log
+    role_icons = {"user": "👤", "ai": "🤖", "admin": "👨‍💼"}
+    role_names = {"user": "Юзер", "ai": "ИИ", "admin": "Админ"}
 
-    for chat_id, msg_id in conversation:
-        try:
-            bot.forward_message(admin_chat_id, chat_id, msg_id)
-        except Exception as e:
-            logger.error(f"Error forwarding msg {msg_id}: {e}")
+    lines = []
+    for entry in log[-30:]:  # Last 30 messages
+        icon = role_icons.get(entry["role"], "❓")
+        name = role_names.get(entry["role"], entry["role"])
+        time = entry.get("time", "")
+        text = entry["text"][:200]  # Trim long messages
+        lines.append(f"{icon} <b>{name}</b> [{time}]:\n{text}")
+
+    chat_text = "\n\n".join(lines)
+
+    # Telegram message limit ~4096 chars
+    header = f"💬 <b>Диалог с @{username} (ID: <code>{user_id}</code>):</b>\n\n"
+    full_text = header + chat_text
+    if len(full_text) > 4000:
+        full_text = header + "...(обрезано)\n\n" + "\n\n".join(lines[-10:])
 
     markup = types.InlineKeyboardMarkup(row_width=2)
-    markup.add(
-        types.InlineKeyboardButton(
-            text="💬 Ответить пользователю",
-            callback_data=f"open_ticket_{user_id}"
-        ),
-        types.InlineKeyboardButton(
-            text="✅ Всё ок",
-            callback_data=f"peek_done"
-        )
-    )
+    markup.add(types.InlineKeyboardButton(
+        text="💬 Ответить пользователю",
+        callback_data=f"reply_to_{user_id}"
+    ))
+    if user_id in active_tickets:
+        markup.add(types.InlineKeyboardButton(
+            text="✅ Закрыть тикет",
+            callback_data=f"close_ticket_{user_id}"
+        ))
+    else:
+        markup.add(types.InlineKeyboardButton(
+            text="👌 Ок",
+            callback_data="peek_done"
+        ))
 
-    bot.send_message(
+    sent = bot.send_message(
         admin_chat_id,
-        f"👆 Диалог @{username} (ID: <code>{user_id}</code>) — {len(conversation)} сообщ.",
+        full_text,
         reply_markup=markup,
         parse_mode="HTML"
     )
+    ticket_message_to_user[sent.message_id] = user_id
 
 
 def open_ticket_conversation(admin_chat_id: int, user_id: int):
@@ -293,9 +359,18 @@ def open_ticket_conversation(admin_chat_id: int, user_id: int):
 
 def handle_escalation(chat_id: int, user_id: int, reason: str = ""):
     """Обработка эскалации — создаёт тикет и уведомляет пользователя."""
+    if user_id in active_tickets:
+        return  # Already escalated
     username = user_data_cache.get(user_id, f"id{user_id}")
     create_admin_ticket(user_id, username, reason)
-    bot.send_message(chat_id, "Ваш вопрос передан оператору. Он ответит в ближайшее время.")
+    bot.send_message(
+        chat_id,
+        "🙋 Администратор уже спешит в чат!\n\n"
+        "Пожалуйста, ожидайте — оператор ответит в ближайшее время. "
+        "Все ваши сообщения будут переданы ему."
+    )
+    # Notify AI about escalation so it has context when ticket is closed
+    get_ai_response(user_id, "[SYSTEM] Пользователь был переведён на оператора. Диалог с ИИ приостановлен до закрытия тикета.")
     logger.info(f"Escalation triggered for user {user_id}")
 
 
@@ -310,6 +385,7 @@ def process_ai_response(chat_id: int, user_id: int, user_text: str):
             sent = bot.send_message(chat_id, ai_text)
             # Сохраняем ответ AI для пересылки в тикете
             user_conversation[user_id].append((chat_id, sent.message_id))
+            chat_log[user_id].append({"role": "ai", "text": ai_text, "time": datetime.now().strftime("%H:%M")})
         except Exception as e:
             logger.error(f"Error sending AI response to {chat_id}: {e}")
 
@@ -368,14 +444,18 @@ def handle_help(message):
    <i>Пример:</i> <code>/compensate 7</code>
    Продлит подписку на N дней по текущему тарифу каждого юзера
 
+<b>🔧 Тех. работы:</b>
+7. <b>/maintenance on</b> — Включить режим техработ (ИИ сообщает юзерам)
+   <b>/maintenance off</b> — Выключить режим техработ
+
 <b>💬 Мониторинг:</b>
-7. <b>/chats</b> — Просмотр всех диалогов юзеров с ИИ
+8. <b>/chats</b> — Просмотр всех диалогов юзеров с ИИ
    Можно читать переписку и при необходимости вмешаться
 
 <b>🎫 Тикеты:</b>
-8. <b>/reply</b> — Показать активные тикеты (эскалации)
-9. Ответьте (reply) на сообщение тикета, чтобы отправить ответ пользователю
-10. Используйте кнопку «Закрыть тикет» для завершения
+9. <b>/reply</b> — Показать активные тикеты (эскалации)
+10. Ответьте (reply) на сообщение тикета, чтобы отправить ответ пользователю
+11. Используйте кнопку «Закрыть тикет» для завершения
 
 <b>/help</b> — Эта справка
 """
@@ -414,10 +494,20 @@ def handle_info(message):
             payed_refs = user.get("payed_refs", 0)
             is_used_trial = user.get("is_used_trial", False)
 
+            # Get email if exists
+            user_email = "—"
+            try:
+                email_resp = requests.get(f"{SUPPORT_API_URL}/internal/user-email/{tg_id}")
+                if email_resp.status_code == 200:
+                    user_email = email_resp.json().get("email", "—")
+            except Exception:
+                pass
+
             text = f"""<b>📋 Информация о пользователе</b>
 
 <b>ID:</b> <code>{tg_id}</code>
 <b>Username:</b> @{username}
+<b>Email:</b> {user_email}
 <b>UUID:</b> <code>{user.get("uuid", "—")}</code>
 
 <b>📊 Подписка:</b>
@@ -633,6 +723,31 @@ def handle_disable_device_limit(message):
         bot.reply_to(message, f"⚠️ Произошла ошибка: {str(e)}")
 
 
+@bot.message_handler(commands=['maintenance'], func=lambda message: message.from_user.id in ADMIN_IDS)
+def handle_maintenance(message):
+    """Переключить режим тех. работ: /maintenance on|off"""
+    try:
+        parts = message.text.split()
+        if len(parts) != 2 or parts[1] not in ('on', 'off'):
+            bot.reply_to(message, "Использование: /maintenance on|off")
+            return
+
+        enabled = parts[1] == 'on'
+        resp = requests.post(
+            f"{SUPPORT_API_URL}/internal/support/maintenance",
+            json={"enabled": enabled},
+            timeout=10
+        )
+        if resp.status_code == 200:
+            status = "🔴 ВКЛ" if enabled else "🟢 ВЫКЛ"
+            bot.reply_to(message, f"Режим тех. работ: {status}\nИИ будет {'сообщать юзерам о техработах' if enabled else 'работать в обычном режиме'}.")
+        else:
+            bot.reply_to(message, f"Ошибка: {resp.status_code}")
+    except Exception as e:
+        logger.error(f"Error in /maintenance: {e}")
+        bot.reply_to(message, f"Ошибка: {e}")
+
+
 @bot.message_handler(commands=['compensate'], func=lambda message: message.from_user.id in ADMIN_IDS)
 def handle_compensate(message):
     try:
@@ -728,13 +843,13 @@ def format_time_ago(dt):
 def show_active_chats(message):
     """Показывает всех юзеров с диалогами — для мониторинга."""
     logger.info(f"Admin {message.from_user.id} requested /chats")
-    if not user_conversation:
+    if not chat_log:
         bot.reply_to(message, "Нет активных диалогов.")
         return
 
     # Сортируем по времени последней активности (свежие сверху)
     sorted_users = sorted(
-        user_conversation.keys(),
+        chat_log.keys(),
         key=lambda uid: user_last_activity.get(uid, datetime.min),
         reverse=True
     )
@@ -742,7 +857,7 @@ def show_active_chats(message):
     markup = types.InlineKeyboardMarkup()
     for user_id in sorted_users[:20]:  # Макс 20 чтобы не перегрузить
         username = user_data_cache.get(user_id, f"id{user_id}")
-        msg_count = len(user_conversation[user_id])
+        msg_count = len(chat_log[user_id])
         last_time = user_last_activity.get(user_id)
         time_str = format_time_ago(last_time) if last_time else "?"
 
@@ -763,8 +878,8 @@ def show_active_chats(message):
 
     legend = (
         "💬 <b>Диалоги с ИИ:</b>\n\n"
-        "🟢 активен (< 10 мин)\n"
-        "🟡 недавно (< 1 ч)\n"
+        "🟢 активен (&lt; 10 мин)\n"
+        "🟡 недавно (&lt; 1 ч)\n"
         "⚪ давно\n"
         "🎫 есть тикет"
     )
@@ -804,7 +919,19 @@ def handle_user_text_message(message):
 
     # Сохраняем сообщение юзера для пересылки в тикете
     user_conversation[user_id].append((message.chat.id, message.message_id))
+    chat_log[user_id].append({"role": "user", "text": message.text, "time": datetime.now().strftime("%H:%M")})
     user_last_activity[user_id] = datetime.now()
+    save_state()
+
+    # If ticket is open, forward to admin and remind user to wait
+    if user_id in active_tickets:
+        for admin_id in ADMIN_IDS:
+            try:
+                bot.forward_message(admin_id, message.chat.id, message.message_id)
+            except Exception as e:
+                logger.error(f"Error forwarding to admin {admin_id}: {e}")
+        bot.send_message(message.chat.id, "⏳ Ваш вопрос уже у оператора. Пожалуйста, ожидайте ответа.")
+        return
 
     # Проверяем, просит ли пользователь оператора напрямую
     if check_user_wants_escalation(message.text):
@@ -827,6 +954,17 @@ def handle_user_voice_message(message):
 
     # Сохраняем голосовое для пересылки в тикете
     user_conversation[user_id].append((message.chat.id, message.message_id))
+    save_state()
+
+    # If ticket is open, forward to admin and remind user to wait
+    if user_id in active_tickets:
+        for admin_id in ADMIN_IDS:
+            try:
+                bot.forward_message(admin_id, message.chat.id, message.message_id)
+            except Exception as e:
+                logger.error(f"Error forwarding to admin {admin_id}: {e}")
+        bot.send_message(message.chat.id, "⏳ Ваш вопрос уже у оператора. Пожалуйста, ожидайте ответа.")
+        return
 
     bot.send_chat_action(message.chat.id, 'typing')
 
@@ -883,6 +1021,17 @@ def handle_user_media_message(message):
 
     # Сохраняем сообщение для пересылки в тикете
     user_conversation[user_id].append((message.chat.id, message.message_id))
+    save_state()
+
+    # If ticket is open, forward to admin and remind user to wait
+    if user_id in active_tickets:
+        for admin_id in ADMIN_IDS:
+            try:
+                bot.forward_message(admin_id, message.chat.id, message.message_id)
+            except Exception as e:
+                logger.error(f"Error forwarding to admin {admin_id}: {e}")
+        bot.send_message(message.chat.id, "⏳ Ваш вопрос уже у оператора. Пожалуйста, ожидайте ответа.")
+        return
 
     # Фото с подписью — отправляем только подпись в AI
     if message.caption:
@@ -911,6 +1060,19 @@ def callback_handler(call):
         user_id = int(call.data.split('_')[-1])
         bot.answer_callback_query(call.id, text="Загружаю...")
         open_ticket_conversation(call.message.chat.id, user_id)
+    elif call.data.startswith('reply_to_'):
+        user_id = int(call.data.split('_')[-1])
+        bot.answer_callback_query(call.id, text="Ответьте на это сообщение")
+        # Create a reply anchor so admin can reply
+        if user_id not in active_tickets:
+            active_tickets.add(user_id)
+            save_state()
+        sent = bot.send_message(
+            call.message.chat.id,
+            f"✍️ <b>Ответьте (reply) на это сообщение, чтобы написать @{user_data_cache.get(user_id, str(user_id))}:</b>",
+            parse_mode="HTML"
+        )
+        ticket_message_to_user[sent.message_id] = user_id
     elif call.data == 'peek_done':
         bot.answer_callback_query(call.id, text="👍")
         try:
@@ -928,8 +1090,16 @@ def callback_handler(call):
 def close_ticket(admin_chat_id, user_id):
     if user_id in active_tickets:
         active_tickets.discard(user_id)
+        save_state()
         if user_id in user_conversation:
             del user_conversation[user_id]
+        # Notify AI that operator finished, so it has full context
+        get_ai_response(user_id, "[SYSTEM] Оператор завершил диалог и закрыл тикет. ИИ-ассистент снова активен.")
+        # Notify user
+        try:
+            bot.send_message(user_id, "✅ Оператор завершил диалог. Если у вас появятся новые вопросы — пишите, ИИ-ассистент снова на связи!")
+        except Exception as e:
+            logger.error(f"Error notifying user {user_id} about ticket close: {e}")
         logger.info(f"Ticket closed for user {user_id}")
         bot.send_message(admin_chat_id, f"✅ Тикет для {user_id} закрыт.")
     else:
@@ -984,6 +1154,14 @@ def handle_admin_reply(message):
         elif message.content_type == 'sticker':
             bot.send_sticker(user_id, message.sticker.file_id)
             bot.send_message(user_id, "✉️ Ответ поддержки (стикер)")
+
+        # Record admin reply in AI history and chat log
+        if message.content_type == 'text':
+            get_ai_response(user_id, f"[SYSTEM] Оператор ответил пользователю: {message.text}")
+            chat_log[user_id].append({"role": "admin", "text": message.text, "time": datetime.now().strftime("%H:%M")})
+        else:
+            get_ai_response(user_id, f"[SYSTEM] Оператор отправил пользователю {message.content_type}.")
+            chat_log[user_id].append({"role": "admin", "text": f"[{message.content_type}]", "time": datetime.now().strftime("%H:%M")})
 
         logger.info(f"Admin {message.from_user.id} replied to user {user_id}")
         bot.reply_to(message, f"✅ Ответ отправлен пользователю @{username}.")
