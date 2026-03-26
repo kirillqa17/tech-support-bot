@@ -281,16 +281,29 @@ def peek_conversation(admin_chat_id: int, user_id: int):
         icon = role_icons.get(entry["role"], "❓")
         name = role_names.get(entry["role"], entry["role"])
         time = entry.get("time", "")
-        text = entry["text"][:200]  # Trim long messages
+        text = entry["text"]  # Full text, no truncation
         lines.append(f"{icon} <b>{name}</b> [{time}]:\n{text}")
 
-    chat_text = "\n\n".join(lines)
-
-    # Telegram message limit ~4096 chars
     header = f"💬 <b>Диалог с @{username} (ID: <code>{user_id}</code>):</b>\n\n"
-    full_text = header + chat_text
-    if len(full_text) > 4000:
-        full_text = header + "...(обрезано)\n\n" + "\n\n".join(lines[-10:])
+
+    # Split into multiple messages if needed (4096 limit)
+    messages_to_send = []
+    current = header
+    for line in lines:
+        if len(current) + len(line) + 2 > 4000:
+            messages_to_send.append(current)
+            current = ""
+        current += line + "\n\n"
+    if current.strip():
+        messages_to_send.append(current)
+
+    for msg in messages_to_send[:-1]:
+        try:
+            bot.send_message(admin_chat_id, msg, parse_mode="HTML")
+        except Exception as e:
+            logger.error(f"Error sending peek msg: {e}")
+
+    full_text = messages_to_send[-1] if messages_to_send else header
 
     markup = types.InlineKeyboardMarkup(row_width=2)
     markup.add(types.InlineKeyboardButton(
