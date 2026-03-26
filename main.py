@@ -380,11 +380,30 @@ def process_ai_response(chat_id: int, user_id: int, user_text: str):
 
     ai_text = get_ai_response(user_id, user_text)
     if ai_text:
-        # Отправляем ответ AI (без кнопки)
+        # Разбиваем длинные сообщения на части (лимит Telegram: 4096)
         try:
-            sent = bot.send_message(chat_id, ai_text)
-            # Сохраняем ответ AI для пересылки в тикете
-            user_conversation[user_id].append((chat_id, sent.message_id))
+            chunks = []
+            if len(ai_text) <= 4096:
+                chunks = [ai_text]
+            else:
+                # Разбиваем по переносам строк, не разрывая слова
+                remaining = ai_text
+                while remaining:
+                    if len(remaining) <= 4096:
+                        chunks.append(remaining)
+                        break
+                    # Ищем последний перенос строки в пределах лимита
+                    cut = remaining[:4096].rfind('\n')
+                    if cut == -1:
+                        cut = remaining[:4096].rfind(' ')
+                    if cut == -1:
+                        cut = 4096
+                    chunks.append(remaining[:cut])
+                    remaining = remaining[cut:].lstrip()
+
+            for chunk in chunks:
+                sent = bot.send_message(chat_id, chunk)
+                user_conversation[user_id].append((chat_id, sent.message_id))
             chat_log[user_id].append({"role": "ai", "text": ai_text, "time": datetime.now().strftime("%H:%M")})
         except Exception as e:
             logger.error(f"Error sending AI response to {chat_id}: {e}")
