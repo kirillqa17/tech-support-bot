@@ -1205,4 +1205,10 @@ def handle_admin_reply(message):
 # Запускаем бота
 if __name__ == '__main__':
     logger.info("Tech support bot starting...")
-    bot.infinity_polling()
+    while True:
+        try:
+            bot.infinity_polling(timeout=60, long_polling_timeout=30, restart_on_change=False)
+        except Exception as e:
+            logger.error(f"Polling crashed: {e}, restarting in 5 seconds...")
+            import time
+            time.sleep(5)
