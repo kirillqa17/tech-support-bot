@@ -349,7 +349,7 @@ def peek_conversation(admin_chat_id: int, user_id: int):
             name = role
 
         # Format time
-        created = entry.get("created_at", "")
+        created = entry.get("time", entry.get("created_at", ""))
         time_str = ""
         if created:
             try:
@@ -359,16 +359,13 @@ def peek_conversation(admin_chat_id: int, user_id: int):
             except Exception:
                 pass
 
-        # Check if this is a photo message
+        # Check if this is a photo message — show inline
         if text and text.startswith("[photo:"):
-            # Extract file_id and caption
             import re as re_mod
-            match = re_mod.match(r'\[photo:([^\]]+)\](.*)', text)
+            match = re_mod.match(r'\[photo:([^\]]+)\]\s*(.*)', text)
             if match:
-                file_id = match.group(1).strip()
                 caption = match.group(2).strip()
                 lines.append(f"{icon} <b>{name}</b> [{time_str}]:\n📷 Фото" + (f": {caption}" if caption else ""))
-                # We'll send photo separately after text messages
                 continue
 
         lines.append(f"{icon} <b>{name}</b> [{time_str}]:\n{text}")
@@ -1022,6 +1019,12 @@ def handle_user_text_message(message):
 
     # Проверяем, просит ли пользователь оператора напрямую
     if check_user_wants_escalation(message.text):
+        # Save the user message to DB before escalation
+        try:
+            requests.post(f"{SUPPORT_API_URL}/admin/chats/{user_id}/save",
+                          json={"role": "user", "content": message.text}, timeout=5)
+        except Exception:
+            pass
         handle_escalation(message.chat.id, user_id, reason="Пользователь попросил оператора")
         return
 
