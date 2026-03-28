@@ -264,25 +264,47 @@ def create_admin_ticket(user_id: int, username: str, reason: str = ""):
 
 
 def peek_conversation(admin_chat_id: int, user_id: int):
-    """Просмотр переписки юзера — показывает текстовый лог с ролями."""
+    """Просмотр переписки юзера — загружает из БД через API."""
     username = user_data_cache.get(user_id, f"id{user_id}")
-    log = chat_log.get(user_id, [])
 
-    if not log:
-        bot.send_message(admin_chat_id, "Нет сохранённых сообщений.")
-        return
+    # Load from DB via API
+    try:
+        resp = requests.get(f"{SUPPORT_API_URL}/admin/chats/{user_id}", timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            db_messages = data.get("messages", [])
+        else:
+            db_messages = []
+    except Exception as e:
+        logger.error(f"Failed to load chat from API for {user_id}: {e}")
+        db_messages = []
 
-    # Build readable chat log
-    role_icons = {"user": "👤", "ai": "🤖", "admin": "👨‍💼"}
-    role_names = {"user": "Юзер", "ai": "ИИ", "admin": "Админ"}
+    # Fallback to in-memory if DB is empty
+    if not db_messages:
+        log = chat_log.get(user_id, [])
+        if not log:
+            bot.send_message(admin_chat_id, "Нет сохранённых сообщений.")
+            return
+        db_messages = [{"role": e["role"], "content": e["text"], "created_at": e.get("time", "")} for e in log[-30:]]
+
+    role_icons = {"user": "👤", "assistant": "🤖", "ai": "🤖", "admin": "👨‍💼"}
+    role_names = {"user": "Юзер", "assistant": "ИИ", "ai": "ИИ", "admin": "Админ"}
 
     lines = []
-    for entry in log[-30:]:  # Last 30 messages
-        icon = role_icons.get(entry["role"], "❓")
-        name = role_names.get(entry["role"], entry["role"])
-        time = entry.get("time", "")
-        text = entry["text"]  # Full text, no truncation
-        lines.append(f"{icon} <b>{name}</b> [{time}]:\n{text}")
+    for entry in db_messages[-30:]:
+        role = entry.get("role", "user")
+        icon = role_icons.get(role, "❓")
+        name = role_names.get(role, role)
+        created = entry.get("created_at", "")
+        # Format time
+        try:
+            from datetime import datetime
+            dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+            time_str = dt.strftime("%H:%M")
+        except Exception:
+            time_str = str(created)[:5] if created else ""
+        text = entry.get("content", entry.get("text", ""))
+        lines.append(f"{icon} <b>{name}</b> [{time_str}]:\n{text}")
 
     header = f"💬 <b>Диалог с @{username} (ID: <code>{user_id}</code>):</b>\n\n"
 
@@ -331,43 +353,9 @@ def peek_conversation(admin_chat_id: int, user_id: int):
 
 
 def open_ticket_conversation(admin_chat_id: int, user_id: int):
-    """Пересылает админу всю переписку с юзером и предлагает ответить."""
-    username = user_data_cache.get(user_id, f"id{user_id}")
-    conversation = user_conversation.get(user_id, [])
-
-    if not conversation:
-        bot.send_message(admin_chat_id, "Нет сохранённых сообщений.")
-        return
-
-    bot.send_message(
-        admin_chat_id,
-        f"📖 <b>Переписка с @{username} ({user_id}):</b>",
-        parse_mode="HTML"
-    )
-
-    # Пересылаем все сообщения из диалога
-    for chat_id, msg_id in conversation:
-        try:
-            bot.forward_message(admin_chat_id, chat_id, msg_id)
-        except Exception as e:
-            logger.error(f"Error forwarding msg {msg_id}: {e}")
-
-    # Финальное сообщение для reply
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton(
-        text="✅ Закрыть тикет",
-        callback_data=f"close_ticket_{user_id}"
-    ))
-
-    sent = bot.send_message(
-        admin_chat_id,
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"👆 Переписка с @{username} (ID: <code>{user_id}</code>)\n\n"
-        f"<b>Ответьте на это сообщение, чтобы написать пользователю.</b>",
-        reply_markup=markup,
-        parse_mode="HTML"
-    )
-    ticket_message_to_user[sent.message_id] = user_id
+    """Показывает переписку из БД и предлагает ответить."""
+    # Use peek_conversation to show the chat from DB
+    peek_conversation(admin_chat_id, user_id)
 
 
 def handle_escalation(chat_id: int, user_id: int, reason: str = ""):
@@ -1080,8 +1068,19 @@ def handle_user_media_message(message):
 
 @bot.callback_query_handler(func=lambda call: True)
 def callback_handler(call):
-    if call.data.startswith('peek_'):
-        user_id = int(call.data.split('_')[-1])
+    if call.data == 'peek_done':
+        bot.answer_callback_query(call.id, text="👍")
+        try:
+            bot.delete_message(call.message.chat.id, call.message.message_id)
+        except Exception:
+            pass
+        return
+    elif call.data.startswith('peek_'):
+        try:
+            user_id = int(call.data.split('_')[-1])
+        except ValueError:
+            bot.answer_callback_query(call.id, text="Ошибка")
+            return
         bot.answer_callback_query(call.id, text="Загружаю переписку...")
         peek_conversation(call.message.chat.id, user_id)
     elif call.data.startswith('open_ticket_'):
@@ -1105,12 +1104,6 @@ def callback_handler(call):
             parse_mode="HTML"
         )
         ticket_message_to_user[sent.message_id] = user_id
-    elif call.data == 'peek_done':
-        bot.answer_callback_query(call.id, text="👍")
-        try:
-            bot.delete_message(call.message.chat.id, call.message.message_id)
-        except Exception:
-            pass
     elif call.data.startswith('close_ticket_'):
         user_id = int(call.data.split('_')[-1])
         close_ticket(call.message.chat.id, user_id)
