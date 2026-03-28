@@ -323,73 +323,79 @@ def peek_conversation(admin_chat_id: int, user_id: int):
             return
         db_messages = [{"role": e["role"], "content": e["text"], "created_at": e.get("time", "")} for e in log[-30:]]
 
-    role_icons = {"user": "👤", "assistant": "🤖", "ai": "🤖", "admin": "👨‍💼"}
+    import re as re_mod
 
-    lines = []
+    # Build renderable items: either text lines or photo file_ids
+    items = []  # list of {"type": "text", "line": str} or {"type": "photo", "file_id": str, "caption": str, "label": str}
     for entry in db_messages[-30:]:
         role = entry.get("role", "user")
         text = entry.get("content", entry.get("text", ""))
 
-        # Skip [SYSTEM] messages — they're internal
+        # Skip [SYSTEM] messages
         if text and text.startswith("[SYSTEM]"):
             continue
 
-        # Determine display name
         if role == "user":
-            icon = "👤"
-            name = f"@{username}"
+            icon, name = "👤", f"@{username}"
         elif role in ("assistant", "ai"):
-            icon = "🤖"
-            name = "ИИ"
+            icon, name = "🤖", "ИИ"
         elif role == "admin":
-            icon = "👨‍💼"
-            name = "Админ"
+            icon, name = "👨‍💼", "Админ"
         else:
-            icon = "❓"
-            name = role
+            icon, name = "❓", role
 
-        # Format time
         created = entry.get("time", entry.get("created_at", ""))
         time_str = ""
         if created:
             try:
-                from datetime import datetime as dt_cls
-                d = dt_cls.fromisoformat(str(created).replace("Z", "+00:00"))
+                d = datetime.fromisoformat(str(created).replace("Z", "+00:00"))
                 time_str = d.strftime("%H:%M")
             except Exception:
                 pass
 
-        # Check if this is a photo message — show inline
+        label = f"{icon} <b>{name}</b> [{time_str}]"
+
+        # Photo message
         if text and text.startswith("[photo:"):
-            import re as re_mod
             match = re_mod.match(r'\[photo:([^\]]+)\]\s*(.*)', text)
             if match:
-                caption = match.group(2).strip()
-                lines.append(f"{icon} <b>{name}</b> [{time_str}]:\n📷 Фото" + (f": {caption}" if caption else ""))
+                items.append({"type": "photo", "file_id": match.group(1).strip(),
+                              "caption": match.group(2).strip(), "label": label})
                 continue
 
-        lines.append(f"{icon} <b>{name}</b> [{time_str}]:\n{text}")
+        items.append({"type": "text", "line": f"{label}:\n{text}"})
 
     header = f"💬 <b>Диалог с @{username} (ID: <code>{user_id}</code>):</b>\n\n"
 
-    # Split into multiple messages if needed (4096 limit)
-    messages_to_send = []
-    current = header
-    for line in lines:
-        if len(current) + len(line) + 2 > 4000:
-            messages_to_send.append(current)
-            current = ""
-        current += line + "\n\n"
-    if current.strip():
-        messages_to_send.append(current)
+    # Send items: batch text lines, send photos inline
+    current_text = header
+    for item in items:
+        if item["type"] == "photo":
+            # Flush accumulated text first
+            if current_text.strip():
+                try:
+                    bot.send_message(admin_chat_id, current_text, parse_mode="HTML")
+                except Exception as e:
+                    logger.error(f"Error sending peek text: {e}")
+                current_text = ""
+            # Send the photo
+            try:
+                cap = f"{item['label']}:\n📷 {item['caption']}" if item['caption'] else item['label']
+                bot.send_photo(admin_chat_id, item["file_id"], caption=cap, parse_mode="HTML")
+            except Exception as e:
+                logger.error(f"Error sending photo: {e}")
+                current_text += f"{item['label']}:\n📷 Фото (недоступно)\n\n"
+        else:
+            line = item["line"]
+            if len(current_text) + len(line) + 2 > 4000:
+                try:
+                    bot.send_message(admin_chat_id, current_text, parse_mode="HTML")
+                except Exception as e:
+                    logger.error(f"Error sending peek text: {e}")
+                current_text = ""
+            current_text += line + "\n\n"
 
-    for msg in messages_to_send[:-1]:
-        try:
-            bot.send_message(admin_chat_id, msg, parse_mode="HTML")
-        except Exception as e:
-            logger.error(f"Error sending peek msg: {e}")
-
-    full_text = messages_to_send[-1] if messages_to_send else header
+    full_text = current_text if current_text.strip() else header
 
     markup = types.InlineKeyboardMarkup(row_width=2)
     markup.add(types.InlineKeyboardButton(
