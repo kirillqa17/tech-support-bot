@@ -29,8 +29,7 @@ PROXYAPI_KEY = os.getenv('PROXYAPI_KEY', '')
 # Инициализируем бота
 bot = telebot.TeleBot(BOT_TOKEN)
 
-# Тикет-система
-active_tickets = set()  # set of user_ids with open tickets
+# Тикет-система (DB-backed via API)
 user_data_cache = {}  # user_id -> username
 # Маппинг: message_id тикета в админ-чате -> user_id (для reply)
 ticket_message_to_user = {}
@@ -40,6 +39,40 @@ user_conversation = defaultdict(list)
 chat_log = defaultdict(list)
 # Время последнего сообщения: user_id -> datetime
 user_last_activity = {}
+# In-memory cache of active tickets, synced with DB
+active_tickets = set()
+
+
+def db_open_ticket(user_id: int, username: str = "", reason: str = ""):
+    """Create/reopen ticket in DB."""
+    try:
+        requests.post(f"{SUPPORT_API_URL}/admin/tickets/open",
+                      json={"telegram_id": user_id, "username": username, "reason": reason}, timeout=5)
+    except Exception as e:
+        logger.error(f"Failed to open ticket in DB: {e}")
+    active_tickets.add(user_id)
+
+
+def db_close_ticket(user_id: int):
+    """Close ticket in DB."""
+    try:
+        requests.post(f"{SUPPORT_API_URL}/admin/tickets/close",
+                      json={"telegram_id": user_id}, timeout=5)
+    except Exception as e:
+        logger.error(f"Failed to close ticket in DB: {e}")
+    active_tickets.discard(user_id)
+
+
+def db_load_active_tickets():
+    """Load active tickets from DB on startup."""
+    try:
+        resp = requests.get(f"{SUPPORT_API_URL}/admin/tickets/active", timeout=5)
+        if resp.status_code == 200:
+            data = resp.json()
+            return set(t["telegram_id"] for t in data)
+    except Exception as e:
+        logger.error(f"Failed to load active tickets from DB: {e}")
+    return set()
 
 # Маппинг планов
 PLAN_NAMES = {
@@ -125,6 +158,9 @@ def load_state():
 
 # Load persisted state
 load_state()
+# Sync active tickets from DB
+active_tickets = db_load_active_tickets()
+logger.info(f"Loaded {len(active_tickets)} active tickets from DB")
 
 
 def format_subscription_end(sub_end_str):
@@ -201,7 +237,7 @@ def check_ai_escalation(ai_text: str) -> bool:
 
 def create_admin_ticket(user_id: int, username: str, reason: str = ""):
     """Создаёт тикет для админа с инфо о юзере и кнопкой 'Открыть'."""
-    active_tickets.add(user_id)
+    db_open_ticket(user_id, username, reason)
     save_state()
 
     # Получаем информацию о пользователе
@@ -1096,7 +1132,7 @@ def callback_handler(call):
         bot.answer_callback_query(call.id, text="Ответьте на это сообщение")
         # Create a reply anchor so admin can reply
         if user_id not in active_tickets:
-            active_tickets.add(user_id)
+            db_open_ticket(user_id, user_data_cache.get(user_id, str(user_id)), "reply_to")
             save_state()
         sent = bot.send_message(
             call.message.chat.id,
@@ -1114,7 +1150,7 @@ def callback_handler(call):
 
 def close_ticket(admin_chat_id, user_id):
     if user_id in active_tickets:
-        active_tickets.discard(user_id)
+        db_close_ticket(user_id)
         save_state()
         if user_id in user_conversation:
             del user_conversation[user_id]
