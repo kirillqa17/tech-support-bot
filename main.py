@@ -324,22 +324,53 @@ def peek_conversation(admin_chat_id: int, user_id: int):
         db_messages = [{"role": e["role"], "content": e["text"], "created_at": e.get("time", "")} for e in log[-30:]]
 
     role_icons = {"user": "👤", "assistant": "🤖", "ai": "🤖", "admin": "👨‍💼"}
-    role_names = {"user": "Юзер", "assistant": "ИИ", "ai": "ИИ", "admin": "Админ"}
 
     lines = []
     for entry in db_messages[-30:]:
         role = entry.get("role", "user")
-        icon = role_icons.get(role, "❓")
-        name = role_names.get(role, role)
-        created = entry.get("created_at", "")
-        # Format time
-        try:
-            from datetime import datetime
-            dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
-            time_str = dt.strftime("%H:%M")
-        except Exception:
-            time_str = str(created)[:5] if created else ""
         text = entry.get("content", entry.get("text", ""))
+
+        # Skip [SYSTEM] messages — they're internal
+        if text and text.startswith("[SYSTEM]"):
+            continue
+
+        # Determine display name
+        if role == "user":
+            icon = "👤"
+            name = f"@{username}"
+        elif role in ("assistant", "ai"):
+            icon = "🤖"
+            name = "ИИ"
+        elif role == "admin":
+            icon = "👨‍💼"
+            name = "Админ"
+        else:
+            icon = "❓"
+            name = role
+
+        # Format time
+        created = entry.get("created_at", "")
+        time_str = ""
+        if created:
+            try:
+                from datetime import datetime as dt_cls
+                d = dt_cls.fromisoformat(str(created).replace("Z", "+00:00"))
+                time_str = d.strftime("%H:%M")
+            except Exception:
+                pass
+
+        # Check if this is a photo message
+        if text and text.startswith("[photo:"):
+            # Extract file_id and caption
+            import re as re_mod
+            match = re_mod.match(r'\[photo:([^\]]+)\](.*)', text)
+            if match:
+                file_id = match.group(1).strip()
+                caption = match.group(2).strip()
+                lines.append(f"{icon} <b>{name}</b> [{time_str}]:\n📷 Фото" + (f": {caption}" if caption else ""))
+                # We'll send photo separately after text messages
+                continue
+
         lines.append(f"{icon} <b>{name}</b> [{time_str}]:\n{text}")
 
     header = f"💬 <b>Диалог с @{username} (ID: <code>{user_id}</code>):</b>\n\n"
@@ -1077,7 +1108,28 @@ def handle_user_media_message(message):
 
     # Сохраняем сообщение для пересылки в тикете
     user_conversation[user_id].append((message.chat.id, message.message_id))
+
+    # Save photo file_id for later display
+    if message.content_type == 'photo' and message.photo:
+        file_id = message.photo[-1].file_id  # Largest photo
+        media_text = f"[photo:{file_id}]"
+        if message.caption:
+            media_text += f" {message.caption}"
+    elif message.content_type == 'document' and message.document:
+        media_text = f"[file:{message.document.file_id}:{message.document.file_name or 'file'}]"
+    else:
+        media_text = message.caption or f"[{message.content_type}]"
+
+    chat_log[user_id].append({"role": "user", "text": media_text, "time": datetime.now().strftime("%H:%M")})
+    user_last_activity[user_id] = datetime.now()
     save_state()
+
+    # Save media message to DB via admin reply endpoint (as user role)
+    try:
+        requests.post(f"{SUPPORT_API_URL}/admin/chats/{user_id}/save",
+                      json={"role": "user", "content": media_text}, timeout=5)
+    except Exception:
+        pass
 
     # If ticket is open, forward to admin and remind user to wait
     if user_id in active_tickets:
