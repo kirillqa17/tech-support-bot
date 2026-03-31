@@ -949,35 +949,55 @@ def format_time_ago(dt):
 
 @bot.message_handler(commands=['chats'], func=lambda message: message.from_user.id in ADMIN_IDS)
 def show_active_chats(message):
-    """Показывает всех юзеров с диалогами — для мониторинга."""
+    """Показывает всех юзеров с диалогами — загружает из БД."""
     logger.info(f"Admin {message.from_user.id} requested /chats")
-    if not chat_log:
+
+    # Load chats from DB API instead of in-memory chat_log
+    try:
+        resp = requests.get(f"{SUPPORT_API_URL}/admin/chats", timeout=10)
+        if resp.status_code != 200:
+            bot.reply_to(message, "Ошибка загрузки чатов.")
+            return
+        db_chats = resp.json()
+    except Exception as e:
+        logger.error(f"Failed to load chats from DB: {e}")
+        bot.reply_to(message, "Ошибка соединения с API.")
+        return
+
+    if not db_chats:
         bot.reply_to(message, "Нет активных диалогов.")
         return
 
-    # Сортируем по времени последней активности (свежие сверху)
-    sorted_users = sorted(
-        chat_log.keys(),
-        key=lambda uid: user_last_activity.get(uid, datetime.min),
-        reverse=True
-    )
+    # Sync active tickets
+    sync_active_tickets()
 
     markup = types.InlineKeyboardMarkup()
-    for user_id in sorted_users[:20]:  # Макс 20 чтобы не перегрузить
-        username = user_data_cache.get(user_id, f"id{user_id}")
-        msg_count = len(chat_log[user_id])
-        last_time = user_last_activity.get(user_id)
-        time_str = format_time_ago(last_time) if last_time else "?"
+    for chat in db_chats[:20]:
+        user_id = chat.get("telegram_id")
+        username = chat.get("username", f"id{user_id}")
+        msg_count = chat.get("message_count", 0)
+        last_time_str = chat.get("last_time", "")
+
+        # Parse time for status
+        try:
+            last_time = datetime.fromisoformat(last_time_str.replace("+00:00", "").replace("Z", ""))
+            time_str = format_time_ago(last_time)
+        except Exception:
+            time_str = "?"
+            last_time = None
 
         # Статус
         if user_id in active_tickets:
             status = "🎫"
         elif last_time and (datetime.now() - last_time).total_seconds() < 600:
-            status = "🟢"  # активен (< 10 мин)
+            status = "🟢"
         elif last_time and (datetime.now() - last_time).total_seconds() < 3600:
-            status = "🟡"  # недавно (< 1 ч)
+            status = "🟡"
         else:
-            status = "⚪"  # давно
+            status = "⚪"
+
+        # Cache username for later use
+        user_data_cache[user_id] = username
 
         markup.add(types.InlineKeyboardButton(
             text=f"{status} @{username} · {msg_count} сообщ. · {time_str}",
