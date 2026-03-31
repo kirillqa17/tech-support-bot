@@ -74,6 +74,24 @@ def db_load_active_tickets():
         logger.error(f"Failed to load active tickets from DB: {e}")
     return set()
 
+
+def sync_active_tickets():
+    """Periodically sync active tickets from DB (catches tickets opened from web admin)."""
+    global active_tickets
+    try:
+        db_tickets = db_load_active_tickets()
+        if db_tickets != active_tickets:
+            added = db_tickets - active_tickets
+            removed = active_tickets - db_tickets
+            active_tickets = db_tickets
+            if added:
+                logger.info(f"[sync_tickets] Added from DB: {added}")
+            if removed:
+                logger.info(f"[sync_tickets] Removed (closed in DB): {removed}")
+    except Exception as e:
+        logger.error(f"[sync_tickets] Error: {e}")
+
+
 # Маппинг планов
 PLAN_NAMES = {
     "base": "Base",
@@ -1006,6 +1024,9 @@ def handle_user_text_message(message):
     user_data_cache[user_id] = username
 
     logger.info(f"User @{username} ({user_id}) sent text: {message.text[:50]}...")
+
+    # Sync tickets from DB (catches tickets opened from web admin)
+    sync_active_tickets()
 
     # Сохраняем сообщение юзера для пересылки в тикете
     user_conversation[user_id].append((message.chat.id, message.message_id))
