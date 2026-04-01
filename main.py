@@ -38,6 +38,9 @@ def internal_headers():
 bot = telebot.TeleBot(BOT_TOKEN)
 
 # Тикет-система (DB-backed via API)
+import threading
+AUTO_CLOSE_HOURS = 15
+auto_close_timers = {}  # user_id -> threading.Timer
 user_data_cache = {}  # user_id -> username
 # Маппинг: message_id тикета в админ-чате -> user_id (для reply)
 ticket_message_to_user = {}
@@ -187,6 +190,11 @@ load_state()
 # Sync active tickets from DB
 active_tickets = db_load_active_tickets()
 logger.info(f"Loaded {len(active_tickets)} active tickets from DB")
+# Start auto-close timers for existing tickets
+for tid in active_tickets:
+    schedule_auto_close(tid)
+if active_tickets:
+    logger.info(f"Scheduled auto-close for {len(active_tickets)} existing tickets")
 
 
 def format_subscription_end(sub_end_str):
@@ -455,12 +463,30 @@ def open_ticket_conversation(admin_chat_id: int, user_id: int):
     peek_conversation(admin_chat_id, user_id)
 
 
+def schedule_auto_close(user_id: int):
+    """Schedule automatic ticket close after AUTO_CLOSE_HOURS."""
+    # Cancel existing timer if any
+    old_timer = auto_close_timers.pop(user_id, None)
+    if old_timer:
+        old_timer.cancel()
+
+    def auto_close():
+        logger.info(f"Auto-closing ticket for user {user_id} after {AUTO_CLOSE_HOURS}h")
+        close_ticket(None, user_id, auto=True)
+
+    timer = threading.Timer(AUTO_CLOSE_HOURS * 3600, auto_close)
+    timer.daemon = True
+    timer.start()
+    auto_close_timers[user_id] = timer
+
+
 def handle_escalation(chat_id: int, user_id: int, reason: str = ""):
     """Обработка эскалации — создаёт тикет и уведомляет пользователя."""
     if user_id in active_tickets:
         return  # Already escalated
     username = user_data_cache.get(user_id, f"id{user_id}")
     create_admin_ticket(user_id, username, reason)
+    schedule_auto_close(user_id)
     bot.send_message(
         chat_id,
         "🙋 Администратор уже спешит в чат!\n\n"
@@ -1260,9 +1286,13 @@ def callback_handler(call):
 
 
 
-def close_ticket(admin_chat_id, user_id):
+def close_ticket(admin_chat_id, user_id, auto=False):
     if user_id in active_tickets:
         db_close_ticket(user_id)
+        # Cancel auto-close timer if exists
+        timer = auto_close_timers.pop(user_id, None)
+        if timer:
+            timer.cancel()
         save_state()
         if user_id in user_conversation:
             del user_conversation[user_id]
@@ -1270,13 +1300,15 @@ def close_ticket(admin_chat_id, user_id):
         get_ai_response(user_id, "[SYSTEM] Оператор завершил диалог и закрыл тикет. ИИ-ассистент снова активен.")
         # Notify user
         try:
-            bot.send_message(user_id, "✅ Оператор завершил диалог. Если у вас появятся новые вопросы — пишите, ИИ-ассистент снова на связи!")
+            bot.send_message(user_id, "✅ Всего доброго! Если появятся вопросы — обращайтесь, всегда рады помочь! 😊")
         except Exception as e:
             logger.error(f"Error notifying user {user_id} about ticket close: {e}")
-        logger.info(f"Ticket closed for user {user_id}")
-        bot.send_message(admin_chat_id, f"✅ Тикет для {user_id} закрыт.")
+        logger.info(f"Ticket closed for user {user_id} (auto={auto})")
+        if admin_chat_id:
+            bot.send_message(admin_chat_id, f"✅ Тикет для {user_id} закрыт{' (автоматически)' if auto else ''}.")
     else:
-        bot.send_message(admin_chat_id, "Тикет уже закрыт или не существует.")
+        if admin_chat_id:
+            bot.send_message(admin_chat_id, "Тикет уже закрыт или не существует.")
 
 
 # ===== ОТВЕТ АДМИНА =====
