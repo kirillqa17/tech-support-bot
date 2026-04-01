@@ -25,6 +25,14 @@ ADMIN_IDS = list(map(int, os.getenv('ADMIN_IDS').split(',')))
 API_URL = os.getenv('API_URL_SUPPORT')
 SUPPORT_API_URL = os.getenv('SUPPORT_API_URL', 'http://vpn-api:8080')
 PROXYAPI_KEY = os.getenv('PROXYAPI_KEY', '')
+ADMIN_KEY = os.getenv('ADMIN_KEY', '')
+INTERNAL_KEY = os.getenv('INTERNAL_KEY', '')
+
+def admin_headers():
+    return {"X-Admin-Key": ADMIN_KEY, "Content-Type": "application/json"}
+
+def internal_headers():
+    return {"X-Internal-Key": INTERNAL_KEY, "Content-Type": "application/json"}
 
 # Инициализируем бота
 bot = telebot.TeleBot(BOT_TOKEN)
@@ -47,7 +55,7 @@ def db_open_ticket(user_id: int, username: str = "", reason: str = ""):
     """Create/reopen ticket in DB."""
     try:
         requests.post(f"{SUPPORT_API_URL}/admin/tickets/open",
-                      json={"telegram_id": user_id, "username": username, "reason": reason}, timeout=5)
+                      json={"telegram_id": user_id, "username": username, "reason": reason}, headers=admin_headers(), timeout=5)
     except Exception as e:
         logger.error(f"Failed to open ticket in DB: {e}")
     active_tickets.add(user_id)
@@ -57,7 +65,7 @@ def db_close_ticket(user_id: int):
     """Close ticket in DB."""
     try:
         requests.post(f"{SUPPORT_API_URL}/admin/tickets/close",
-                      json={"telegram_id": user_id}, timeout=5)
+                      json={"telegram_id": user_id}, headers=admin_headers(), timeout=5)
     except Exception as e:
         logger.error(f"Failed to close ticket in DB: {e}")
     active_tickets.discard(user_id)
@@ -66,7 +74,7 @@ def db_close_ticket(user_id: int):
 def db_load_active_tickets():
     """Load active tickets from DB on startup."""
     try:
-        resp = requests.get(f"{SUPPORT_API_URL}/admin/tickets/active", timeout=5)
+        resp = requests.get(f"{SUPPORT_API_URL}/admin/tickets/active", headers=admin_headers(), timeout=5)
         if resp.status_code == 200:
             data = resp.json()
             return set(t["telegram_id"] for t in data)
@@ -202,6 +210,7 @@ def get_ai_response(telegram_id: int, message: str):
         resp = requests.post(
             f"{SUPPORT_API_URL}/internal/support/chat",
             json={"telegram_id": telegram_id, "message": message},
+            headers=internal_headers(),
             timeout=30
         )
         if resp.status_code == 200:
@@ -323,7 +332,7 @@ def peek_conversation(admin_chat_id: int, user_id: int):
 
     # Load from DB via API
     try:
-        resp = requests.get(f"{SUPPORT_API_URL}/admin/chats/{user_id}", timeout=10)
+        resp = requests.get(f"{SUPPORT_API_URL}/admin/chats/{user_id}", headers=admin_headers(), timeout=10)
         if resp.status_code == 200:
             data = resp.json()
             db_messages = data.get("messages", [])
@@ -605,7 +614,7 @@ def handle_info(message):
             # Get email if exists
             user_email = "—"
             try:
-                email_resp = requests.get(f"{SUPPORT_API_URL}/internal/user-email/{tg_id}")
+                email_resp = requests.get(f"{SUPPORT_API_URL}/internal/user-email/{tg_id}", headers=internal_headers())
                 if email_resp.status_code == 200:
                     user_email = email_resp.json().get("email", "—")
             except Exception:
@@ -844,6 +853,7 @@ def handle_maintenance(message):
         resp = requests.post(
             f"{SUPPORT_API_URL}/internal/support/maintenance",
             json={"enabled": enabled},
+            headers=internal_headers(),
             timeout=10
         )
         if resp.status_code == 200:
@@ -954,7 +964,7 @@ def show_active_chats(message):
 
     # Load chats from DB API instead of in-memory chat_log
     try:
-        resp = requests.get(f"{SUPPORT_API_URL}/admin/chats", timeout=10)
+        resp = requests.get(f"{SUPPORT_API_URL}/admin/chats", headers=admin_headers(), timeout=10)
         if resp.status_code != 200:
             bot.reply_to(message, "Ошибка загрузки чатов.")
             return
@@ -1069,7 +1079,7 @@ def handle_user_text_message(message):
         # Save the user message to DB before escalation
         try:
             requests.post(f"{SUPPORT_API_URL}/admin/chats/{user_id}/save",
-                          json={"role": "user", "content": message.text}, timeout=5)
+                          json={"role": "user", "content": message.text}, headers=admin_headers(), timeout=5)
         except Exception:
             pass
         handle_escalation(message.chat.id, user_id, reason="Пользователь попросил оператора")
@@ -1177,7 +1187,7 @@ def handle_user_media_message(message):
     # Save media message to DB via admin reply endpoint (as user role)
     try:
         requests.post(f"{SUPPORT_API_URL}/admin/chats/{user_id}/save",
-                      json={"role": "user", "content": media_text}, timeout=5)
+                      json={"role": "user", "content": media_text}, headers=admin_headers(), timeout=5)
     except Exception:
         pass
 
@@ -1323,7 +1333,7 @@ def handle_admin_reply(message):
             chat_log[user_id].append({"role": "admin", "text": message.text, "time": datetime.now().strftime("%H:%M")})
             try:
                 requests.post(f"{SUPPORT_API_URL}/admin/chats/{user_id}/save",
-                              json={"role": "admin", "content": message.text}, timeout=5)
+                              json={"role": "admin", "content": message.text}, headers=admin_headers(), timeout=5)
             except Exception:
                 pass
         else:
