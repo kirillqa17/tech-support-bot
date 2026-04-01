@@ -190,11 +190,6 @@ load_state()
 # Sync active tickets from DB
 active_tickets = db_load_active_tickets()
 logger.info(f"Loaded {len(active_tickets)} active tickets from DB")
-# Start auto-close timers for existing tickets
-for tid in active_tickets:
-    schedule_auto_close(tid)
-if active_tickets:
-    logger.info(f"Scheduled auto-close for {len(active_tickets)} existing tickets")
 
 
 def format_subscription_end(sub_end_str):
@@ -1380,6 +1375,11 @@ def handle_admin_reply(message):
 
 # Запускаем бота
 if __name__ == '__main__':
+    # Start auto-close timers for existing open tickets
+    for tid in active_tickets:
+        schedule_auto_close(tid)
+    if active_tickets:
+        logger.info(f"Scheduled auto-close for {len(active_tickets)} existing tickets")
     logger.info("Tech support bot starting...")
     while True:
         try:
