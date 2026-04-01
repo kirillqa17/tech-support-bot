@@ -1318,12 +1318,15 @@ def handle_admin_reply(message):
             bot.send_sticker(user_id, message.sticker.file_id)
             bot.send_message(user_id, "✉️ Ответ поддержки (стикер)")
 
-        # Record admin reply in AI history and chat log
+        # Record admin reply in chat log and DB (do NOT call AI — ticket is active)
         if message.content_type == 'text':
-            get_ai_response(user_id, f"[SYSTEM] Оператор ответил пользователю: {message.text}")
             chat_log[user_id].append({"role": "admin", "text": message.text, "time": datetime.now().strftime("%H:%M")})
+            try:
+                requests.post(f"{SUPPORT_API_URL}/admin/chats/{user_id}/save",
+                              json={"role": "admin", "content": message.text}, timeout=5)
+            except Exception:
+                pass
         else:
-            get_ai_response(user_id, f"[SYSTEM] Оператор отправил пользователю {message.content_type}.")
             chat_log[user_id].append({"role": "admin", "text": f"[{message.content_type}]", "time": datetime.now().strftime("%H:%M")})
 
         logger.info(f"Admin {message.from_user.id} replied to user {user_id}")
