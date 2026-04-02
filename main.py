@@ -582,18 +582,22 @@ def handle_help(message):
    <i>Пример:</i> <code>/compensate 7</code>
    Продлит подписку на N дней по текущему тарифу каждого юзера
 
+<b>📊 Рефералы:</b>
+7. <b>/refs [N]</b> — Топ рефералов (по умолчанию 20, макс 50)
+   <i>Пример:</i> <code>/refs 10</code>
+
 <b>🔧 Тех. работы:</b>
-7. <b>/maintenance on</b> — Включить режим техработ (ИИ сообщает юзерам)
+8. <b>/maintenance on</b> — Включить режим техработ (ИИ сообщает юзерам)
    <b>/maintenance off</b> — Выключить режим техработ
 
 <b>💬 Мониторинг:</b>
-8. <b>/chats</b> — Просмотр всех диалогов юзеров с ИИ
+9. <b>/chats</b> — Просмотр всех диалогов юзеров с ИИ
    Можно читать переписку и при необходимости вмешаться
 
 <b>🎫 Тикеты:</b>
-9. <b>/reply</b> — Показать активные тикеты (эскалации)
-10. Ответьте (reply) на сообщение тикета, чтобы отправить ответ пользователю
-11. Используйте кнопку «Закрыть тикет» для завершения
+10. <b>/reply</b> — Показать активные тикеты (эскалации)
+11. Ответьте (reply) на сообщение тикета, чтобы отправить ответ пользователю
+12. Используйте кнопку «Закрыть тикет» для завершения
 
 <b>/help</b> — Эта справка
 """
@@ -859,6 +863,57 @@ def handle_disable_device_limit(message):
     except Exception as e:
         logger.error(f"Error in /disable_device_limit: {e}")
         bot.reply_to(message, f"⚠️ Произошла ошибка: {str(e)}")
+
+
+@bot.message_handler(commands=['refs'], func=lambda message: message.from_user.id in ADMIN_IDS)
+def handle_refs(message):
+    """Топ рефералов: /refs [количество]"""
+    try:
+        parts = message.text.split()
+        limit = 20
+        if len(parts) > 1:
+            try:
+                limit = min(int(parts[1]), 50)
+            except ValueError:
+                pass
+
+        resp = requests.get(
+            f"{SUPPORT_API_URL}/admin/referral/top",
+            headers=admin_headers(),
+            timeout=10
+        )
+        if resp.status_code != 200:
+            bot.reply_to(message, f"Ошибка API: {resp.status_code}")
+            return
+
+        data = resp.json()
+        if not data:
+            bot.reply_to(message, "Нет пользователей с рефералами.")
+            return
+
+        data = data[:limit]
+        lines = ["<b>📊 Топ рефералов</b>\n"]
+        lines.append("<pre>")
+        lines.append(f"{'#':>3} {'Юзернейм':<16} {'TG ID':>12} {'Реф':>4} {'Опл':>4}")
+        lines.append("─" * 43)
+        for i, u in enumerate(data, 1):
+            username = u.get("username") or "—"
+            if len(username) > 15:
+                username = username[:14] + "…"
+            tg_id = u["telegram_id"]
+            total = u["total_refs"]
+            paid = u["payed_refs"]
+            lines.append(f"{i:>3} {username:<16} {tg_id:>12} {total:>4} {paid:>4}")
+        lines.append("</pre>")
+
+        total_refs = sum(u["total_refs"] for u in data)
+        total_paid = sum(u["payed_refs"] for u in data)
+        lines.append(f"\n<b>Итого (топ-{len(data)}):</b> {total_refs} рефералов, {total_paid} оплатили")
+
+        bot.send_message(message.chat.id, "\n".join(lines), parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"Error in /refs: {e}")
+        bot.reply_to(message, f"⚠️ Ошибка: {e}")
 
 
 @bot.message_handler(commands=['maintenance'], func=lambda message: message.from_user.id in ADMIN_IDS)
