@@ -287,11 +287,29 @@ def create_admin_ticket(user_id: int, username: str, reason: str = ""):
             sub_end = format_subscription_end(user.get("subscription_end", "—"))
             is_active = "Активна" if user.get("is_active") == 1 else "Неактивна"
             is_pro = "Да" if user.get("is_pro") else "Нет"
+            auto_renew = "Да" if user.get("auto_renew") else "Нет"
+            device_limit = user.get("device_limit", "—")
+            card = user.get("card_last4")
+            card_text = f"•••• {card}" if card else "Нет"
+
+            # Get email
+            user_email = "—"
+            try:
+                email_resp = requests.get(f"{SUPPORT_API_URL}/internal/user-email/{user_id}", headers=internal_headers())
+                if email_resp.status_code == 200:
+                    user_email = email_resp.json().get("email") or "—"
+            except Exception:
+                pass
+
             user_info_text = (
+                f"\n<b>Email:</b> {user_email}"
                 f"\n<b>Тариф:</b> {plan}"
                 f"\n<b>Статус:</b> {is_active}"
                 f"\n<b>PRO:</b> {is_pro}"
                 f"\n<b>Окончание:</b> {sub_end}"
+                f"\n<b>Автопродление:</b> {auto_renew}"
+                f"\n<b>Карта:</b> {card_text}"
+                f"\n<b>Устройств:</b> {device_limit}"
             )
     except Exception as e:
         logger.error(f"Failed to get user info for ticket: {e}")
@@ -665,12 +683,27 @@ def handle_info(message):
             except Exception:
                 pass
 
+            # Payment info
+            card_last4 = user.get("card_last4")
+            card_text = f"•••• {card_last4}" if card_last4 else "Не привязана"
+            payment_method = user.get("payment_method_id")
+            ar_plan = user.get("auto_renew_plan", "—")
+            ar_duration = user.get("auto_renew_duration", "—")
+            created_at = user.get("created_at", "—")
+            try:
+                from datetime import datetime as dt
+                created_dt = dt.fromisoformat(created_at.replace("Z", "+00:00"))
+                created_at = (created_dt + __import__('datetime').timedelta(hours=3)).strftime("%d.%m.%Y %H:%M МСК")
+            except Exception:
+                pass
+
             text = f"""<b>📋 Информация о пользователе</b>
 
 <b>ID:</b> <code>{tg_id}</code>
 <b>Username:</b> @{username}
-<b>Email:</b> {user_email}
+<b>Email:</b> {user_email if user_email != "—" else "Не привязан"}
 <b>UUID:</b> <code>{user.get("uuid", "—")}</code>
+<b>Зарегистрирован:</b> {created_at}
 
 <b>📊 Подписка:</b>
   Тариф: <b>{plan_display}</b>
@@ -678,6 +711,10 @@ def handle_info(message):
   Статус: {is_active}
   Окончание: {sub_end}
   Автопродление: {"✅ Да" if auto_renew else "❌ Нет"}
+
+<b>💳 Оплата:</b>
+  Карта: {card_text}
+  {"Тариф автопродления: " + ar_plan + " / " + ar_duration if auto_renew and ar_plan else ""}
 
 <b>🔧 Настройки:</b>
   Лимит устройств: {device_limit}
