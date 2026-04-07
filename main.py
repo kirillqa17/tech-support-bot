@@ -40,7 +40,9 @@ bot = telebot.TeleBot(BOT_TOKEN)
 # Тикет-система (DB-backed via API)
 import threading
 AUTO_CLOSE_HOURS = 15
+REOPEN_COOLDOWN_MINUTES = 5  # Cooldown after auto-close before new ticket can be created
 auto_close_timers = {}  # user_id -> threading.Timer
+recently_closed = {}  # user_id -> datetime (cooldown after auto-close)
 user_data_cache = {}  # user_id -> username
 # Маппинг: message_id тикета в админ-чате -> user_id (для reply)
 ticket_message_to_user = {}
@@ -87,7 +89,7 @@ def db_load_active_tickets():
 
 
 def sync_active_tickets():
-    """Periodically sync active tickets from DB (catches tickets opened from web admin)."""
+    """Periodically sync active tickets from DB (catches tickets opened from web/admin)."""
     global active_tickets
     try:
         db_tickets = db_load_active_tickets()
@@ -97,6 +99,11 @@ def sync_active_tickets():
             active_tickets = db_tickets
             if added:
                 logger.info(f"[sync_tickets] Added from DB: {added}")
+                # Schedule auto-close for newly discovered tickets (e.g. from website)
+                for user_id in added:
+                    if user_id not in auto_close_timers:
+                        schedule_auto_close(user_id)
+                        logger.info(f"[sync_tickets] Scheduled auto-close for {user_id}")
             if removed:
                 logger.info(f"[sync_tickets] Removed (closed in DB): {removed}")
     except Exception as e:
@@ -479,6 +486,13 @@ def handle_escalation(chat_id: int, user_id: int, reason: str = ""):
     """Обработка эскалации — создаёт тикет и уведомляет пользователя."""
     if user_id in active_tickets:
         return  # Already escalated
+    # Check cooldown — don't re-create ticket right after auto-close
+    if user_id in recently_closed:
+        closed_at = recently_closed[user_id]
+        if (datetime.now() - closed_at).total_seconds() < REOPEN_COOLDOWN_MINUTES * 60:
+            logger.info(f"Skipping escalation for {user_id} — cooldown after recent close")
+            return
+        del recently_closed[user_id]
     username = user_data_cache.get(user_id, f"id{user_id}")
     create_admin_ticket(user_id, username, reason)
     schedule_auto_close(user_id)
@@ -524,6 +538,12 @@ def process_ai_response(chat_id: int, user_id: int, user_text: str):
                 sent = bot.send_message(chat_id, chunk)
                 user_conversation[user_id].append((chat_id, sent.message_id))
             chat_log[user_id].append({"role": "ai", "text": ai_text, "time": datetime.now().strftime("%H:%M")})
+            # Сохраняем ответ AI в БД (для веб-админки)
+            try:
+                requests.post(f"{SUPPORT_API_URL}/admin/chats/{user_id}/save",
+                              json={"role": "ai", "content": ai_text}, headers=admin_headers(), timeout=5)
+            except Exception:
+                pass
         except Exception as e:
             logger.error(f"Error sending AI response to {chat_id}: {e}")
 
@@ -1140,6 +1160,13 @@ def handle_user_text_message(message):
     user_last_activity[user_id] = datetime.now()
     save_state()
 
+    # Сохраняем сообщение пользователя в БД (для веб-админки)
+    try:
+        requests.post(f"{SUPPORT_API_URL}/admin/chats/{user_id}/save",
+                      json={"role": "user", "content": message.text}, headers=admin_headers(), timeout=5)
+    except Exception:
+        pass
+
     # If ticket is open, forward to admin and remind user to wait
     if user_id in active_tickets:
         for admin_id in ADMIN_IDS:
@@ -1152,12 +1179,6 @@ def handle_user_text_message(message):
 
     # Проверяем, просит ли пользователь оператора напрямую
     if check_user_wants_escalation(message.text):
-        # Save the user message to DB before escalation
-        try:
-            requests.post(f"{SUPPORT_API_URL}/admin/chats/{user_id}/save",
-                          json={"role": "user", "content": message.text}, headers=admin_headers(), timeout=5)
-        except Exception:
-            pass
         handle_escalation(message.chat.id, user_id, reason="Пользователь попросил оператора")
         return
 
@@ -1343,16 +1364,22 @@ def close_ticket(admin_chat_id, user_id, auto=False):
         timer = auto_close_timers.pop(user_id, None)
         if timer:
             timer.cancel()
+        # Set cooldown to prevent instant re-escalation
+        recently_closed[user_id] = datetime.now()
         save_state()
         if user_id in user_conversation:
             del user_conversation[user_id]
         # Notify AI that operator finished, so it has full context
-        get_ai_response(user_id, "[SYSTEM] Оператор завершил диалог и закрыл тикет. ИИ-ассистент снова активен.")
-        # Notify user
         try:
-            bot.send_message(user_id, "✅ Всего доброго! Если появятся вопросы — обращайтесь, всегда рады помочь! 😊")
-        except Exception as e:
-            logger.error(f"Error notifying user {user_id} about ticket close: {e}")
+            get_ai_response(user_id, "[SYSTEM] Оператор завершил диалог и закрыл тикет. ИИ-ассистент снова активен.")
+        except Exception:
+            pass
+        # Notify user (only for manual close, not auto-close to avoid triggering replies)
+        if not auto:
+            try:
+                bot.send_message(user_id, "✅ Всего доброго! Если появятся вопросы — обращайтесь, всегда рады помочь! 😊")
+            except Exception as e:
+                logger.error(f"Error notifying user {user_id} about ticket close: {e}")
         logger.info(f"Ticket closed for user {user_id} (auto={auto})")
         if admin_chat_id:
             bot.send_message(admin_chat_id, f"✅ Тикет для {user_id} закрыт{' (автоматически)' if auto else ''}.")
@@ -1421,6 +1448,10 @@ def handle_admin_reply(message):
         else:
             chat_log[user_id].append({"role": "admin", "text": f"[{message.content_type}]", "time": datetime.now().strftime("%H:%M")})
 
+        # Reset auto-close timer on admin activity
+        if user_id in active_tickets:
+            schedule_auto_close(user_id)
+
         logger.info(f"Admin {message.from_user.id} replied to user {user_id}")
         bot.reply_to(message, f"✅ Ответ отправлен пользователю @{username}.")
     except Exception as e:
@@ -1436,10 +1467,4 @@ if __name__ == '__main__':
     if active_tickets:
         logger.info(f"Scheduled auto-close for {len(active_tickets)} existing tickets")
     logger.info("Tech support bot starting...")
-    while True:
-        try:
-            bot.infinity_polling(timeout=60, long_polling_timeout=30, restart_on_change=False)
-        except Exception as e:
-            logger.error(f"Polling crashed: {e}, restarting in 5 seconds...")
-            import time
-            time.sleep(5)
+    bot.infinity_polling(timeout=60, long_polling_timeout=30)
