@@ -651,7 +651,7 @@ def handle_info(message):
             return
 
         tg_id = parts[1]
-        if not tg_id.isdigit():
+        if not (tg_id.isdigit() or (tg_id.startswith('-') and tg_id[1:].isdigit())):
             raise ValueError("Telegram ID должен содержать только цифры")
 
         logger.info(f"Admin {message.from_user.id} requested /info for {tg_id}")
@@ -750,7 +750,7 @@ def handle_squads(message):
             return
 
         tg_id = parts[1]
-        if not tg_id.isdigit():
+        if not (tg_id.isdigit() or (tg_id.startswith('-') and tg_id[1:].isdigit())):
             raise ValueError("Telegram ID должен содержать только цифры")
 
         logger.info(f"Admin {message.from_user.id} requested /squads for {tg_id}")
@@ -803,7 +803,7 @@ def handle_extend(message):
         plan = parts[2].lower()
         days = int(parts[3])
 
-        if not tg_id.isdigit():
+        if not (tg_id.isdigit() or (tg_id.startswith('-') and tg_id[1:].isdigit())):
             raise ValueError("Telegram ID должен содержать только цифры")
 
         if plan not in VALID_PLANS:
@@ -859,7 +859,7 @@ def handle_toggle_pro(message):
         tg_id = parts[1]
         action = parts[2].lower()
 
-        if not tg_id.isdigit():
+        if not (tg_id.isdigit() or (tg_id.startswith('-') and tg_id[1:].isdigit())):
             raise ValueError("Telegram ID должен содержать только цифры")
 
         if action not in ("on", "off"):
@@ -900,7 +900,7 @@ def handle_disable_device_limit(message):
             return
 
         tg_id = parts[1]
-        if not tg_id.isdigit():
+        if not (tg_id.isdigit() or (tg_id.startswith('-') and tg_id[1:].isdigit())):
             raise ValueError("Telegram ID должен содержать только цифры")
 
         logger.info(f"Admin {message.from_user.id} disabling device limit for {tg_id}")
