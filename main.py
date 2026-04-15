@@ -827,6 +827,23 @@ def handle_extend(message):
             if plan.startswith("bs"):
                 squads_info = "Default + BS"
 
+            # Log admin extension to payments ledger (fire-and-forget)
+            try:
+                requests.post(
+                    f"{SUPPORT_API_URL}/internal/payments",
+                    json={
+                        "telegram_id": int(tg_id),
+                        "source": "admin_extend",
+                        "plan": plan,
+                        "days_added": int(days),
+                        "metadata": {"admin_id": message.from_user.id},
+                    },
+                    headers=internal_headers(),
+                    timeout=3,
+                )
+            except Exception as e:
+                logger.warning(f"log_payment for admin extend failed: {e}")
+
             text = (f"✅ Подписка продлена\n\n"
                     f"<b>ID:</b> <code>{tg_id}</code>\n"
                     f"<b>План:</b> {plan_display}\n"
