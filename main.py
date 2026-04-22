@@ -623,6 +623,8 @@ def handle_help(message):
 <b>📊 Рефералы:</b>
 7. <b>/refs [N]</b> — Топ рефералов (по умолчанию 20, макс 50)
    <i>Пример:</i> <code>/refs 10</code>
+   <b>/refs TG_ID</b> — Детальный список рефералов юзера (оплатили/нет, @username, TG ID, срок)
+   <i>Пример:</i> <code>/refs 123456789</code>
 
 <b>🔧 Тех. работы:</b>
 8. <b>/maintenance on</b> — Включить режим техработ (ИИ сообщает юзерам)
@@ -939,11 +941,95 @@ def handle_disable_device_limit(message):
         bot.reply_to(message, f"⚠️ Произошла ошибка: {str(e)}")
 
 
+def format_sub_end_date(sub_end_str):
+    """Короткий формат даты окончания подписки в МСК (без времени)."""
+    if not sub_end_str:
+        return None
+    try:
+        dt_object = datetime.fromisoformat(sub_end_str.replace("Z", "+00:00"))
+        dt_object_moscow = dt_object + timedelta(hours=3)
+        return dt_object_moscow.strftime("%d.%m.%Y")
+    except Exception:
+        return None
+
+
+def send_user_referrals(message, tg_id: str):
+    """Показать детальный список рефералов конкретного юзера: /refs TG_ID."""
+    try:
+        resp = requests.get(
+            f"{SUPPORT_API_URL}/admin/users/{tg_id}/referrals",
+            headers=admin_headers(),
+            timeout=10
+        )
+        if resp.status_code == 404:
+            bot.reply_to(message, f"❌ Пользователь {tg_id} не найден")
+            return
+        if resp.status_code != 200:
+            bot.reply_to(message, f"Ошибка API: {resp.status_code}")
+            return
+
+        data = resp.json()
+        owner_username = data.get("username") or f"id{tg_id}"
+        refs = data.get("referrals", [])
+        total = data.get("referrals_count", 0)
+        paid = data.get("payed_refs_count", 0)
+
+        header = (
+            f"👥 <b>Рефералы @{owner_username}</b> (ID: <code>{tg_id}</code>)\n"
+            f"Всего: <b>{total}</b> | Оплатили: <b>{paid}</b>\n"
+        )
+
+        if not refs:
+            bot.send_message(message.chat.id, header + "\n<i>Нет рефералов.</i>", parse_mode="HTML")
+            return
+
+        paid_refs = [r for r in refs if r.get("has_paid")]
+        unpaid_refs = [r for r in refs if not r.get("has_paid")]
+
+        def fmt_ref(r):
+            uname = r.get("username") or ""
+            tid = r.get("telegram_id")
+            name = f"@{uname}" if uname else f"id{tid}"
+            plan_raw = r.get("plan") or "—"
+            plan = PLAN_NAMES.get(plan_raw, plan_raw)
+            parts = [f"  • {name} (<code>{tid}</code>) — {plan}"]
+            if r.get("has_paid"):
+                end = format_sub_end_date(r.get("subscription_end"))
+                if end:
+                    parts.append(f", до {end}")
+            return "".join(parts)
+
+        sections = []
+        if paid_refs:
+            sections.append(f"\n✅ <b>Оплатившие ({len(paid_refs)}):</b>\n" + "\n".join(fmt_ref(r) for r in paid_refs))
+        if unpaid_refs:
+            sections.append(f"\n❌ <b>Не оплатили ({len(unpaid_refs)}):</b>\n" + "\n".join(fmt_ref(r) for r in unpaid_refs))
+
+        current = header
+        for section in sections:
+            if len(current) + len(section) > 4000:
+                bot.send_message(message.chat.id, current, parse_mode="HTML")
+                current = ""
+            current += section
+
+        if current.strip():
+            bot.send_message(message.chat.id, current, parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"Error in /refs TG_ID: {e}")
+        bot.reply_to(message, f"⚠️ Ошибка: {e}")
+
+
 @bot.message_handler(commands=['refs'], func=lambda message: message.from_user.id in ADMIN_IDS)
 def handle_refs(message):
-    """Топ рефералов: /refs [количество]"""
+    """Топ рефералов: /refs [N] или детали юзера: /refs TG_ID."""
     try:
         parts = message.text.split()
+
+        # /refs TG_ID — если аргумент похож на telegram_id (>= 7 цифр)
+        if len(parts) > 1 and parts[1].isdigit() and len(parts[1]) >= 7:
+            send_user_referrals(message, parts[1])
+            return
+
         limit = 20
         if len(parts) > 1:
             try:
