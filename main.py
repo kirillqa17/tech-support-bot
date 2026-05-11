@@ -605,8 +605,8 @@ def handle_help(message):
    <i>Пример:</i> <code>/squads 123456789</code>
 
 <b>⚙️ Управление подпиской:</b>
-3. <b>/extend TG_ID PLAN DAYS</b> — Продлить подписку
-   <i>Пример:</i> <code>/extend 123456789 base 30</code>
+3. <b>/extend TG_ID PLAN DAYS</b> — Продлить (DAYS &gt; 0) или сократить (DAYS &lt; 0) подписку
+   <i>Примеры:</i> <code>/extend 123456789 base 30</code> или <code>/extend 123456789 base -30</code>
    <i>Планы:</i> base, bsbase, family, bsfamily, trial, free
 
 4. <b>/toggle_pro TG_ID on|off</b> — Включить/выключить PRO режим
@@ -792,7 +792,9 @@ def handle_extend(message):
             plans_list = ", ".join(VALID_PLANS)
             bot.reply_to(message,
                          f"Использование: /extend TG_ID PLAN DAYS\n"
-                         f"Пример: /extend 123456789 base 30\n\n"
+                         f"Примеры:\n"
+                         f"  /extend 123456789 base 30   — продлить на 30 дней\n"
+                         f"  /extend 123456789 base -30  — снять 30 дней\n\n"
                          f"Доступные планы: {plans_list}\n\n"
                          f"<b>Сквады по планам:</b>\n"
                          f"  base, family, trial, free → Default\n"
@@ -813,8 +815,8 @@ def handle_extend(message):
             bot.reply_to(message, f"❌ Неизвестный план '{plan}'.\nДоступные: {plans_list}")
             return
 
-        if days <= 0:
-            raise ValueError("Количество дней должно быть больше 0")
+        if days == 0:
+            raise ValueError("Количество дней не может быть 0")
 
         logger.info(f"Admin {message.from_user.id} extending {tg_id}: plan={plan}, days={days}")
 
@@ -846,10 +848,16 @@ def handle_extend(message):
             except Exception as e:
                 logger.warning(f"log_payment for admin extend failed: {e}")
 
-            text = (f"✅ Подписка продлена\n\n"
+            if days > 0:
+                title = "✅ Подписка продлена"
+                change = f"+{days} дн."
+            else:
+                title = "✅ Подписка сокращена"
+                change = f"{days} дн."
+            text = (f"{title}\n\n"
                     f"<b>ID:</b> <code>{tg_id}</code>\n"
                     f"<b>План:</b> {plan_display}\n"
-                    f"<b>Дней:</b> {days}\n"
+                    f"<b>Изменение:</b> {change}\n"
                     f"<b>Сквады:</b> {squads_info}")
             bot.reply_to(message, text, parse_mode="HTML")
         elif response.status_code == 404:
